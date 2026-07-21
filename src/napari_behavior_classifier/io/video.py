@@ -2,12 +2,31 @@
 
 Wraps sleap_io's Video (which already does on-demand frame decoding) and
 squeezes its trailing singleton channel axis so the array looks like a
-plain (T, H, W) stack to napari.
+plain (T, H, W) stack to napari. This is the only place sleap_io is still
+used now that pose data comes from the analysis .h5 (see `h5_reader.py`) -
+here it's just opening the source video for frame reads, not parsing any
+prediction file.
+
+Benchmarked on a 216k-frame video (frame-navigation-style reads, see project
+notes): opencv ~5ms/frame, pyav ~9ms/frame, sleap_io's own "FFMPEG" backend
+(the default when opencv/av aren't installed) ~350ms/frame - 70x slower,
+enough to make frame-by-frame scrubbing feel frozen. opencv is set as the
+default plugin below.
 """
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
+import sleap_io as sio
+
+sio.set_default_video_plugin("opencv")
+
+
+def load_video_frames(video_path: str | Path) -> "LazyVideoFrames":
+    """Open a video file for on-demand frame reads."""
+    return LazyVideoFrames(sio.load_video(str(video_path)))
 
 
 class LazyVideoFrames:

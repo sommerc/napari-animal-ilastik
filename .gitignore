@@ -11,3 +11,6 @@ wheels/
 
 # Test/research data - large binaries and personal run artifacts, not source
 example_data/
+
+# Claude Code exported memory - local notes, not source
+.claude/PROJECT_MEMORY.md

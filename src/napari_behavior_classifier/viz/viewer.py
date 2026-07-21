@@ -1,10 +1,10 @@
 """Wire a loaded SLEAP project into a napari Viewer.
 
-Parsing a .slp file (load_project_data) is kept separate from building its
+Parsing a .h5 file (load_project_data) is kept separate from building its
 napari layers (build_layers) so a multi-file session can cache the parsed
-data per file - expensive, and occasionally flaky upstream in sleap-io - and
-cheaply tear down/rebuild just the layers when switching which file is
-currently displayed.
+data per file - the .h5 load is cheap, but the video open and layer wiring
+are worth keeping around across frame changes - and cheaply tear down/rebuild
+just the layers when switching which file is currently displayed.
 """
 
 from __future__ import annotations
@@ -17,18 +17,24 @@ import napari
 import numpy as np
 import xarray as xr
 
-from ..io.slp_reader import labels_to_tracks, load_labels
-from ..io.video import LazyVideoFrames
+from ..io.h5_reader import load_tracks
+from ..io.video import LazyVideoFrames, load_video_frames
 from . import layers
 
 DEFAULT_BOX_COLOR = "cyan"
 
-GetBoxColor = Callable[[str, int], str]
+# A manual annotation gets a thicker box outline than a model prediction, since
+# both otherwise share the same per-class color palette and would be
+# indistinguishable at a glance.
+ANNOTATION_EDGE_WIDTH = 4.0
+PREDICTION_EDGE_WIDTH = 1.5
+
+GetBoxStyle = Callable[[str, int], tuple[str, float]]
 
 
 @dataclass
 class ProjectData:
-    """Parsed .slp contents: dataset + lazy video. Cheap to keep resident once loaded."""
+    """Parsed .h5 contents: dataset + lazy video. Cheap to keep resident once loaded."""
 
     ds: xr.Dataset
     video: LazyVideoFrames
@@ -45,31 +51,30 @@ class ProjectLayers:
     refresh: Callable[[], None]
 
 
-def load_project_data(slp_path: str | Path) -> ProjectData:
-    """Parse a .slp file - the expensive (and occasionally flaky-upstream) step."""
-    slp_path = Path(slp_path)
-    labels = load_labels(slp_path)
-    ds = labels_to_tracks(labels, source_slp=slp_path)
-    video = LazyVideoFrames(labels.video)
+def load_project_data(h5_path: str | Path) -> ProjectData:
+    """Parse a SLEAP analysis .h5 file and open its source video."""
+    ds = load_tracks(h5_path)
+    video = load_video_frames(ds.attrs["video_path"])
     return ProjectData(ds=ds, video=video)
 
 
 def build_layers(
     data: ProjectData,
     viewer: napari.Viewer,
-    get_box_color: GetBoxColor | None = None,
+    get_box_style: GetBoxStyle | None = None,
 ) -> ProjectLayers:
     """Add fresh napari layers for already-parsed ProjectData. Cheap - safe to call on every file switch."""
     ds = data.ds
-    get_box_color = get_box_color or (lambda individual, frame: DEFAULT_BOX_COLOR)
+    get_box_style = get_box_style or (lambda individual, frame: (DEFAULT_BOX_COLOR, PREDICTION_EDGE_WIDTH))
 
     image_layer = viewer.add_image(data.video, name=Path(ds.attrs["video_path"]).name, colormap="gray")
 
     points_layer = viewer.add_points(
         np.empty((0, 2), dtype=np.float32),
         name="bodyparts",
-        size=6,
+        size=3,
         face_color="white",
+        border_width=0,
     )
     skeleton_layer = viewer.add_shapes(
         [],
@@ -84,7 +89,7 @@ def build_layers(
         name="bounding box",
         edge_color=DEFAULT_BOX_COLOR,
         face_color="transparent",
-        edge_width=2,
+        edge_width=PREDICTION_EDGE_WIDTH,
     )
 
     def refresh(event=None) -> None:
@@ -103,7 +108,9 @@ def build_layers(
         bbox_layer.data = [box for _, box in boxes]
         if boxes:
             bbox_layer.shape_type = ["rectangle"] * len(boxes)
-            bbox_layer.edge_color = [get_box_color(individual, frame) for individual, _ in boxes]
+            styles = [get_box_style(individual, frame) for individual, _ in boxes]
+            bbox_layer.edge_color = [color for color, _ in styles]
+            bbox_layer.edge_width = [width for _, width in styles]
 
     viewer.dims.events.current_step.connect(refresh)
     refresh()

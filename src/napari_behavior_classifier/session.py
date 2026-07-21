@@ -1,7 +1,7 @@
 """Save/restore GUI session state: which files were open and their annotations.
 
 Features and trained models are deliberately NOT persisted here - they're
-cheap to recompute from the .slp files themselves, which keeps session files
+cheap to recompute from the .h5 files themselves, which keeps session files
 small and avoids staleness if the feature/filter code changes between
 sessions. Class colors are saved so the palette stays consistent on reload.
 """
@@ -16,12 +16,12 @@ from .annotation.store import LabelStore
 
 def save_session(
     path: str | Path,
-    slp_paths: list[str],
+    h5_paths: list[str],
     store: LabelStore,
     class_colors: dict[str, str],
 ) -> None:
     data = {
-        "slp_paths": slp_paths,
+        "h5_paths": h5_paths,
         "class_colors": class_colors,
         "labels": [
             {"source_file": source_file, "individual": individual, "frame": frame, "class": class_name}
@@ -38,4 +38,4 @@ def load_session(path: str | Path) -> tuple[list[str], LabelStore, dict[str, str
     for row in data.get("labels", []):
         store.labels[(row["source_file"], row["individual"], row["frame"])] = row["class"]
 
-    return data.get("slp_paths", []), store, data.get("class_colors", {})
+    return data.get("h5_paths", []), store, data.get("class_colors", {})

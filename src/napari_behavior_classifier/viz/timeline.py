@@ -12,14 +12,45 @@ still divide evenly across the same pixel width.
 from __future__ import annotations
 
 import numpy as np
+from napari.utils import Colormap
 from napari.utils.colormaps import AVAILABLE_COLORMAPS
 
 DEFAULT_COLORMAP = "gray"
-CURATED_COLORMAPS = [
-    name
-    for name in ("gray", "viridis", "magma", "inferno", "plasma", "turbo", "fire", "ice")
-    if name in AVAILABLE_COLORMAPS
-]
+DEFAULT_DIVERGING_COLORMAP = "coolwarm"
+
+# A hand-picked approximation of matplotlib's "coolwarm" diverging colormap
+# (blue -> near-white -> red) - not pixel-identical (matplotlib isn't a
+# dependency here), but the same shape. Diverging colormaps suit features
+# that vary around a meaningful baseline rather than from a true zero - e.g.
+# a segment angle deviating from "straight" - where a sequential map like
+# gray/viridis hides which side of the baseline a value falls on.
+_CUSTOM_COLORMAPS: dict[str, Colormap] = {
+    "coolwarm": Colormap(
+        [
+            (0.230, 0.299, 0.754, 1.0),
+            (0.552, 0.690, 0.988, 1.0),
+            (0.865, 0.865, 0.865, 1.0),
+            (0.957, 0.647, 0.511, 1.0),
+            (0.706, 0.016, 0.150, 1.0),
+        ],
+        display_name="coolwarm",
+    ),
+}
+
+# Sequential maps first, then our custom diverging one, then napari's own
+# diverging ("PiYG") and cyclic ("twilight"/"twilight_shifted" - also a
+# reasonable fit for angle-like data) maps.
+CURATED_COLORMAPS = (
+    [name for name in ("gray", "viridis", "magma", "inferno", "plasma", "turbo", "fire", "ice") if name in AVAILABLE_COLORMAPS]
+    + list(_CUSTOM_COLORMAPS)
+    + [name for name in ("PiYG", "twilight", "twilight_shifted") if name in AVAILABLE_COLORMAPS]
+)
+
+
+def get_colormap(name: str) -> Colormap:
+    if name in _CUSTOM_COLORMAPS:
+        return _CUSTOM_COLORMAPS[name]
+    return AVAILABLE_COLORMAPS.get(name, AVAILABLE_COLORMAPS[DEFAULT_COLORMAP])
 
 
 def _view_bin_edges(view_start: int, view_end: int, width: int, n_frames: int) -> np.ndarray | None:
@@ -145,7 +176,7 @@ def build_undetected_mask(features: np.ndarray, view_start: int, view_end: int, 
 
 def colorize_heatmap(binned: np.ndarray, colormap_name: str = DEFAULT_COLORMAP) -> np.ndarray:
     """binned: (n_features, width) in [0, 1] -> (n_features, width, 3) uint8 RGB."""
-    cmap = AVAILABLE_COLORMAPS.get(colormap_name, AVAILABLE_COLORMAPS[DEFAULT_COLORMAP])
+    cmap = get_colormap(colormap_name)
     rgba = cmap.map(binned.ravel())  # (n_features * width, 4) float in [0, 1]
     rgb = (rgba[:, :3] * 255).astype(np.uint8)
     return rgb.reshape(binned.shape[0], binned.shape[1], 3)
@@ -156,6 +187,41 @@ def blank_columns(rgb: np.ndarray, column_mask: np.ndarray, background_color: tu
     rgb = rgb.copy()
     rgb[..., column_mask, :] = background_color
     return rgb
+
+
+def group_pixel_spans(
+    group_sizes: list[tuple[str, int]], top: int, height: int, gap_px: int
+) -> list[tuple[str, int, int]]:
+    """Split a `height`-pixel vertical band into one sub-span per (name, n_features) group,
+    proportional to each group's row count, with `gap_px` of background between groups.
+
+    Cumulative rounding (rather than rounding each group's height independently)
+    keeps spans gapless/driftless: the last group's bottom always lands exactly
+    on `top + height` minus the trailing gaps.
+    """
+    if not group_sizes or height <= 0:
+        return []
+
+    total_features = sum(n for _, n in group_sizes)
+    if total_features <= 0:
+        return []
+
+    total_gap = gap_px * (len(group_sizes) - 1)
+    available = max(height - total_gap, 0)
+
+    cumulative = 0
+    boundaries = [0]
+    for _, n in group_sizes:
+        cumulative += n
+        boundaries.append(round(cumulative / total_features * available))
+
+    spans = []
+    y = top
+    for i, (name, _n) in enumerate(group_sizes):
+        span_height = boundaries[i + 1] - boundaries[i]
+        spans.append((name, y, y + span_height))
+        y += span_height + gap_px
+    return spans
 
 
 def frame_for_x(x: float, width: int, view_start: int, view_end: int) -> int:
