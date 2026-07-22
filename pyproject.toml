@@ -23,6 +23,7 @@ dependencies = [
 napari-behavior-classifier = "napari_behavior_classifier:napari.yaml"
 
 [project.scripts]
+napari = "napari._main:main"
 napari-behavior-train = "napari_behavior_classifier.cli.train:main"
 napari-behavior-predict = "napari_behavior_classifier.cli.predict:main"
 
