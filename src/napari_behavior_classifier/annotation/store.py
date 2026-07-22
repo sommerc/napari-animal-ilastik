@@ -22,18 +22,47 @@ class LabelStore:
     def add_listener(self, callback: Callable[[], None]) -> None:
         self._listeners.append(callback)
 
+    @staticmethod
+    def _normalize(source_file: str) -> str:
+        """Canonicalize path strings (slash direction etc.) so a key set via one
+        representation (e.g. forward slashes in a hand-built or cross-platform
+        session.json) is still found under another (e.g. `str(Path(...))`'s
+        OS-native form, which is what the widget and `api.py` both use)."""
+        return str(Path(source_file))
+
     def set(self, source_file: str, individual: str, frame: int, class_name: str) -> None:
-        self.labels[(source_file, individual, frame)] = class_name
+        self.labels[(self._normalize(source_file), individual, frame)] = class_name
         self._notify()
 
     def clear(self, source_file: str, individual: str, frame: int) -> None:
-        if self.labels.pop((source_file, individual, frame), None) is not None:
+        if self.labels.pop((self._normalize(source_file), individual, frame), None) is not None:
+            self._notify()
+
+    def set_range(
+        self, source_file: str, individual: str, start_frame: int, end_frame: int, class_name: str
+    ) -> None:
+        """Label every frame in [start_frame, end_frame] (inclusive, order-independent) as one bout."""
+        source_file = self._normalize(source_file)
+        lo, hi = sorted((start_frame, end_frame))
+        for frame in range(lo, hi + 1):
+            self.labels[(source_file, individual, frame)] = class_name
+        self._notify()
+
+    def clear_range(self, source_file: str, individual: str, start_frame: int, end_frame: int) -> None:
+        source_file = self._normalize(source_file)
+        lo, hi = sorted((start_frame, end_frame))
+        changed = False
+        for frame in range(lo, hi + 1):
+            if self.labels.pop((source_file, individual, frame), None) is not None:
+                changed = True
+        if changed:
             self._notify()
 
     def get(self, source_file: str, individual: str, frame: int) -> str | None:
-        return self.labels.get((source_file, individual, frame))
+        return self.labels.get((self._normalize(source_file), individual, frame))
 
     def labeled_frames(self, source_file: str, individual: str) -> list[int]:
+        source_file = self._normalize(source_file)
         return sorted(f for (s, i, f) in self.labels if s == source_file and i == individual)
 
     def source_files(self) -> list[str]:
@@ -41,6 +70,7 @@ class LabelStore:
 
     def to_dense_array(self, source_file: str, individual: str, n_frames: int) -> np.ndarray:
         """(n_frames,) object array of class names, None where unlabeled."""
+        source_file = self._normalize(source_file)
         arr = np.full(n_frames, None, dtype=object)
         for (s, ind, frame), cls in self.labels.items():
             if s == source_file and ind == individual:
@@ -67,7 +97,7 @@ class LabelStore:
         for source_file, individual, frame, class_name in df[
             ["source_file", "individual", "frame", "class"]
         ].itertuples(index=False, name=None):
-            store.labels[(source_file, individual, int(frame))] = class_name
+            store.labels[(cls._normalize(source_file), individual, int(frame))] = class_name
         return store
 
     def _notify(self) -> None:

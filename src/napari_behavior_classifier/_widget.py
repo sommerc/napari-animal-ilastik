@@ -6,6 +6,7 @@ from pathlib import Path
 
 import napari
 import numpy as np
+import pandas as pd
 from qtpy.QtCore import Qt
 from qtpy.QtGui import QColor, QKeySequence, QShortcut
 from qtpy.QtWidgets import (
@@ -64,7 +65,7 @@ class _TrainingSummaryDialog(QDialog):
     def __init__(
         self,
         parent: QWidget,
-        individual: str,
+        individuals: list[str],
         file_names: list[str],
         class_counts: Counter,
         n_features: int,
@@ -83,7 +84,7 @@ class _TrainingSummaryDialog(QDialog):
             else "Out-of-bag accuracy: n/a (not enough labeled frames per class)"
         )
         header_lines = [
-            f"Individual: {individual}",
+            f"Individuals (pooled): {', '.join(individuals)}",
             f"Files: {', '.join(file_names)}",
             f"Labeled frames: {n_frames}  |  Features: {n_features}",
             accuracy_line,
@@ -142,13 +143,22 @@ class BehaviorClassifierWidget(QWidget):
         self._reference_skeleton: Skeleton | None = None  # set from the first opened file
         self.store = LabelStore()
         self._shortcuts: list[QShortcut] = []
+        # fixed (not rebuilt by _rebind_hotkeys, unlike the 1-9 class hotkeys): "0" always
+        # clears whatever's under the current selection/frame, regardless of class list
+        self._clear_shortcut = QShortcut(QKeySequence("0"), self.viewer.window._qt_window)
+        self._clear_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self._clear_shortcut.activated.connect(self._on_clear_label)
         self._class_colors: dict[str, str] = {}
         self._raw_features_cache: dict[tuple[str, str], list[kinematics.FeatureGroup]] = {}
         self._combined_features_cache: dict[tuple[str, str], tuple[np.ndarray, list[str]]] = {}
-        self._pipelines: dict[str, object] = {}  # keyed by individual name, pooled across files
+        # one shared model: classes are monadic (a class label means the same thing
+        # regardless of which tracked animal it's attached to), so training pools
+        # labeled frames across every individual and every open file into one pipeline
+        self._monadic_pipeline: object | None = None
         self._predictions: dict[tuple[str, str], np.ndarray] = {}  # keyed by (source_file, individual)
 
         self.timeline_widget = TimelineWidget(viewer)
+        self.timeline_widget.selection_changed.connect(self._refresh_current_label)
         self.viewer.window.add_dock_widget(self.timeline_widget, area="bottom", name="Timeline")
 
         layout = QVBoxLayout()
@@ -183,7 +193,9 @@ class BehaviorClassifierWidget(QWidget):
         indiv_row.addWidget(self.individual_combo)
         layout.addLayout(indiv_row)
 
-        layout.addWidget(QLabel("Classes (press 1-9 to label current frame):"))
+        layout.addWidget(QLabel(
+            "Classes (1-9: label current frame, or Shift+drag a range on the timeline first; 0: clear):"
+        ))
         self.class_list = QListWidget()
         layout.addWidget(self.class_list)
 
@@ -204,7 +216,7 @@ class BehaviorClassifierWidget(QWidget):
         self.current_label_display = QLabel("Frame: - | Label: -")
         layout.addWidget(self.current_label_display)
 
-        self.clear_label_button = QPushButton("Clear label on this frame")
+        self.clear_label_button = QPushButton("Clear label(s) on this frame/selection")
         self.clear_label_button.clicked.connect(self._on_clear_label)
         layout.addWidget(self.clear_label_button)
 
@@ -217,25 +229,21 @@ class BehaviorClassifierWidget(QWidget):
         annotations_io_row.addWidget(self.load_annotations_button)
         layout.addLayout(annotations_io_row)
 
-        train_predict_row = QHBoxLayout()
-        self.train_button = QPushButton("Train on all open files")
-        self.train_button.clicked.connect(self._on_train_clicked)
-        self.predict_button = QPushButton("Predict on all open files")
-        self.predict_button.clicked.connect(self._on_predict_clicked)
-        train_predict_row.addWidget(self.train_button)
-        train_predict_row.addWidget(self.predict_button)
-        layout.addLayout(train_predict_row)
+        self.train_predict_button = QPushButton("Train + Predict")
+        self.train_predict_button.clicked.connect(self._on_train_and_predict_clicked)
+        layout.addWidget(self.train_predict_button)
 
         self.status_label = QLabel("Not trained yet")
+        self.status_label.setWordWrap(True)
         layout.addWidget(self.status_label)
 
         model_io_row = QHBoxLayout()
-        self.save_model_button = QPushButton("Save model...")
-        self.save_model_button.clicked.connect(self._on_save_model_clicked)
-        self.load_model_button = QPushButton("Load model...")
-        self.load_model_button.clicked.connect(self._on_load_model_clicked)
-        model_io_row.addWidget(self.save_model_button)
-        model_io_row.addWidget(self.load_model_button)
+        self.export_model_button = QPushButton("Export model...")
+        self.export_model_button.clicked.connect(self._on_export_model_clicked)
+        self.export_predictions_button = QPushButton("Export predictions (.csv)...")
+        self.export_predictions_button.clicked.connect(self._on_export_predictions_clicked)
+        model_io_row.addWidget(self.export_model_button)
+        model_io_row.addWidget(self.export_predictions_button)
         layout.addLayout(model_io_row)
 
         self.viewer.dims.events.current_step.connect(self._refresh_current_label)
@@ -249,8 +257,8 @@ class BehaviorClassifierWidget(QWidget):
         return self.open_files[self.active_h5_path].layers
 
     def _on_open_clicked(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Open SLEAP analysis", "", "SLEAP analysis files (*.h5)")
-        if path:
+        paths, _ = QFileDialog.getOpenFileNames(self, "Open SLEAP analysis", "", "SLEAP analysis files (*.h5)")
+        for path in paths:
             self.open_file(path)
 
     def open_file(self, h5_path: str | Path) -> None:
@@ -264,8 +272,8 @@ class BehaviorClassifierWidget(QWidget):
                 try:
                     check_consistent_skeleton(self._reference_skeleton, skeleton, context=Path(h5_path).name)
                 except ValueError as e:
-                    self.status_label.setText(str(e))
                     QMessageBox.warning(self, "Skeleton mismatch", str(e))
+                    self.status_label.setText(f"Skeleton mismatch: {Path(h5_path).name} not added (see dialog)")
                     return
             self.open_files[h5_path] = OpenFile(h5_path=h5_path, data=data)
             item = QListWidgetItem(Path(h5_path).name)
@@ -318,6 +326,7 @@ class BehaviorClassifierWidget(QWidget):
     def _switch_to_file(self, h5_path: str) -> None:
         if h5_path == self.active_h5_path:
             return
+        self.timeline_widget.clear_selection()
         if self.active_h5_path is not None:
             self._last_frame[self.active_h5_path] = int(self.viewer.dims.current_step[0])
             old = self.open_files[self.active_h5_path]
@@ -330,6 +339,7 @@ class BehaviorClassifierWidget(QWidget):
             open_file.data,
             self.viewer,
             get_box_style=lambda individual, frame, sp=h5_path: self._style_for_individual(sp, individual, frame),
+            get_active_individual=lambda: self.individual_combo.currentText(),
         )
         self.active_h5_path = h5_path
 
@@ -352,6 +362,8 @@ class BehaviorClassifierWidget(QWidget):
     def _on_individual_changed(self, index: int) -> None:
         self._refresh_current_label()
         self._refresh_timeline()
+        if self.active_layers is not None:
+            self.active_layers.refresh()
 
     # -- classes --
 
@@ -411,8 +423,14 @@ class BehaviorClassifierWidget(QWidget):
         if self.active_h5_path is None:
             return
         individual = self.individual_combo.currentText()
-        frame = int(self.viewer.dims.current_step[0])
-        self.store.set(self.active_h5_path, individual, frame, class_name)
+        selection = self.timeline_widget.selection
+        if selection is not None:
+            start_frame, end_frame = selection
+            self.store.set_range(self.active_h5_path, individual, start_frame, end_frame, class_name)
+            self.timeline_widget.clear_selection()
+        else:
+            frame = int(self.viewer.dims.current_step[0])
+            self.store.set(self.active_h5_path, individual, frame, class_name)
         self.active_layers.refresh()
         self._refresh_current_label()
         self._refresh_timeline()
@@ -421,8 +439,14 @@ class BehaviorClassifierWidget(QWidget):
         if self.active_h5_path is None:
             return
         individual = self.individual_combo.currentText()
-        frame = int(self.viewer.dims.current_step[0])
-        self.store.clear(self.active_h5_path, individual, frame)
+        selection = self.timeline_widget.selection
+        if selection is not None:
+            start_frame, end_frame = selection
+            self.store.clear_range(self.active_h5_path, individual, start_frame, end_frame)
+            self.timeline_widget.clear_selection()
+        else:
+            frame = int(self.viewer.dims.current_step[0])
+            self.store.clear(self.active_h5_path, individual, frame)
         self.active_layers.refresh()
         self._refresh_current_label()
         self._refresh_timeline()
@@ -433,7 +457,15 @@ class BehaviorClassifierWidget(QWidget):
         individual = self.individual_combo.currentText()
         frame = int(self.viewer.dims.current_step[0])
         label = self.store.get(self.active_h5_path, individual, frame) or "-"
-        self.current_label_display.setText(f"Frame: {frame} | Label: {label}")
+        selection = self.timeline_widget.selection
+        if selection is not None:
+            start_frame, end_frame = selection
+            self.current_label_display.setText(
+                f"Frame: {frame} | Label: {label} | Selection: {start_frame}-{end_frame} "
+                f"({end_frame - start_frame + 1} frames)"
+            )
+        else:
+            self.current_label_display.setText(f"Frame: {frame} | Label: {label}")
 
     def _style_for_individual(self, source_file: str, individual: str, frame: int) -> tuple[str, float]:
         """(edge_color, edge_width) for this individual's bounding box - a manual annotation
@@ -476,96 +508,107 @@ class BehaviorClassifierWidget(QWidget):
             self._combined_features_cache[key] = filterbank.with_filter_bank(raw_features, raw_names)
         return self._combined_features_cache[key]
 
-    def _on_train_clicked(self) -> None:
+    def _on_train_and_predict_clicked(self) -> None:
+        if self._on_train_clicked():
+            self._on_predict_clicked()
+
+    def _on_train_clicked(self) -> bool:
+        """Fits the shared pooled model. Returns whether training actually happened,
+        so the combined Train+Predict button can skip predicting on failure."""
         if not self.open_files:
-            return
-        individual = self.individual_combo.currentText()
-        if not individual:
-            return
+            return False
 
         all_features = []
         all_labels: dict[int, str] = {}
-        file_spans: dict[str, tuple[int, int]] = {}
         offset = 0
+        contributing_individuals: set[str] = set()
+        contributing_files: set[str] = set()
 
         for source_file, open_file in self.open_files.items():
             individuals = [str(v) for v in open_file.data.ds.coords["individuals"].values]
-            if individual not in individuals:
-                continue
-            features, _names = self._get_combined_features(source_file, individual)
-            for frame in self.store.labeled_frames(source_file, individual):
-                all_labels[offset + frame] = self.store.get(source_file, individual, frame)
-            all_features.append(features)
-            file_spans[source_file] = (offset, features.shape[1])
-            offset += features.shape[1]
+            for individual in individuals:
+                labeled_frames = self.store.labeled_frames(source_file, individual)
+                if not labeled_frames:
+                    continue
+                features, _names = self._get_combined_features(source_file, individual)
+                for frame in labeled_frames:
+                    all_labels[offset + frame] = self.store.get(source_file, individual, frame)
+                all_features.append(features)
+                contributing_individuals.add(individual)
+                contributing_files.add(source_file)
+                offset += features.shape[1]
 
         if len(set(all_labels.values())) < 2:
-            self.status_label.setText("Need labeled frames from at least 2 classes, across any open files")
-            return
+            self.status_label.setText("Need labeled frames from at least 2 classes, across any animals/files")
+            return False
 
         combined = np.concatenate(all_features, axis=1)
         pipeline = train_module.train(combined, all_labels)
-        self._pipelines[individual] = pipeline
+        self._monadic_pipeline = pipeline
         report = train_module.oob_summary(pipeline, combined, all_labels)
 
         self.status_label.setText(
-            f"Trained on {len(all_labels)} frames across {len(file_spans)} file(s) "
+            f"Trained on {len(all_labels)} frames pooled across {len(contributing_individuals)} "
+            f"individual(s) in {len(contributing_files)} file(s) "
             f"({len(set(all_labels.values()))} classes, {combined.shape[0]} features)"
             + (f" | OOB accuracy: {report.accuracy:.0%}" if report is not None else "")
         )
         class_counts = Counter(all_labels.values())
-        file_names = [Path(f).name for f in file_spans]
-        _TrainingSummaryDialog(self, individual, file_names, class_counts, combined.shape[0], report).exec()
+        file_names = [Path(f).name for f in contributing_files]
+        _TrainingSummaryDialog(
+            self, sorted(contributing_individuals), file_names, class_counts, combined.shape[0], report
+        ).exec()
+        return True
 
-    def _predict_all_open_files(self, individual: str, pipeline) -> int:
-        """Predict on every open file that has `individual`. Returns how many files were predicted."""
+    def _predict_all_open_files(self, pipeline) -> int:
+        """Predict every individual across every open file with the shared monadic model."""
         n_predicted = 0
         for source_file, open_file in self.open_files.items():
             individuals = [str(v) for v in open_file.data.ds.coords["individuals"].values]
-            if individual not in individuals:
-                continue
-            features, _names = self._get_combined_features(source_file, individual)
-            self._predictions[(source_file, individual)] = train_module.predict(pipeline, features)
-            n_predicted += 1
+            for individual in individuals:
+                features, _names = self._get_combined_features(source_file, individual)
+                self._predictions[(source_file, individual)] = train_module.predict(pipeline, features)
+                n_predicted += 1
         return n_predicted
 
     def _on_predict_clicked(self) -> None:
-        individual = self.individual_combo.currentText()
-        pipeline = self._pipelines.get(individual)
-        if pipeline is None:
-            self.status_label.setText(f"No trained (or loaded) model for '{individual}' yet")
+        if self._monadic_pipeline is None:
+            self.status_label.setText("No trained (or loaded) model yet")
             return
 
-        n_predicted = self._predict_all_open_files(individual, pipeline)
-        self.status_label.setText(f"Predicted on {n_predicted} file(s) for '{individual}'")
+        n_predicted = self._predict_all_open_files(self._monadic_pipeline)
+        self.status_label.setText(f"Predicted on {n_predicted} animal track(s)")
 
         if self.active_layers is not None:
             self.active_layers.refresh()
         self._refresh_timeline()
 
-    def _on_save_model_clicked(self) -> None:
-        individual = self.individual_combo.currentText()
-        pipeline = self._pipelines.get(individual)
-        if pipeline is None:
-            self.status_label.setText("Train a model before saving it")
+    def _on_export_model_clicked(self) -> None:
+        """Export-only: the model is meant for later batch processing (e.g. via `api.py`
+        or another tool), not for loading back into this widget."""
+        if self._monadic_pipeline is None:
+            self.status_label.setText("Train a model before exporting it")
             return
-        path, _ = QFileDialog.getSaveFileName(self, "Save model", "", "Model files (*.joblib)")
+        path, _ = QFileDialog.getSaveFileName(self, "Export model", "", "Model files (*.joblib)")
         if path:
-            train_module.save_pipeline(pipeline, path)
+            train_module.save_pipeline(self._monadic_pipeline, path)
+            self.status_label.setText(f"Exported model to {Path(path).name}")
 
-    def _on_load_model_clicked(self) -> None:
-        path, _ = QFileDialog.getOpenFileName(self, "Load model", "", "Model files (*.joblib)")
-        if not path or not self.open_files:
+    def _on_export_predictions_clicked(self) -> None:
+        if not self._predictions:
+            self.status_label.setText("No predictions yet - run Train + Predict first")
             return
-        individual = self.individual_combo.currentText()
-        pipeline = train_module.load_pipeline(path)
-        self._pipelines[individual] = pipeline
-        n_predicted = self._predict_all_open_files(individual, pipeline)
+        path, _ = QFileDialog.getSaveFileName(self, "Export predictions", "", "CSV files (*.csv)")
+        if not path:
+            return
 
-        self.status_label.setText(f"Loaded model from {Path(path).name}, predicted on {n_predicted} file(s)")
-        if self.active_layers is not None:
-            self.active_layers.refresh()
-        self._refresh_timeline()
+        rows = [
+            (Path(source_file).name, individual, frame, class_name)
+            for (source_file, individual), predictions in self._predictions.items()
+            for frame, class_name in enumerate(predictions)
+        ]
+        pd.DataFrame(rows, columns=["File", "Animal_ID", "Frame", "Class"]).to_csv(path, index=False)
+        self.status_label.setText(f"Exported {len(rows)} predicted frames to {Path(path).name}")
 
     # -- session (which files + annotations) --
 

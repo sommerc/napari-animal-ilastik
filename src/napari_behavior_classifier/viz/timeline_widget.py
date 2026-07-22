@@ -8,7 +8,7 @@ from __future__ import annotations
 
 import napari
 import numpy as np
-from qtpy.QtCore import QRectF, Qt
+from qtpy.QtCore import QRectF, Qt, Signal
 from qtpy.QtGui import QColor, QImage, QMouseEvent, QPainter, QPen, QPixmap, QResizeEvent, QWheelEvent
 from qtpy.QtWidgets import QComboBox, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
@@ -35,6 +35,8 @@ ZOOM_STEP = 1.25
 # against a colormap using that same hue) - the same halo trick as subtitle text.
 CURRENT_FRAME_OUTLINE_WIDTH = 4
 CURRENT_FRAME_LINE_WIDTH = 2
+# translucent so the annotation/prediction bars and heatmap stay legible underneath
+SELECTION_FILL_COLOR = (255, 255, 0, 60)
 
 # Distances/speed are plain sequential magnitudes; angles vary around a meaningful
 # baseline ("straight") rather than from a true zero, so a diverging colormap reads
@@ -47,6 +49,10 @@ _DEFAULT_GROUP_COLORMAP = {
 
 
 class TimelineWidget(QWidget):
+    # emitted whenever `selection` is set or cleared, so listeners (the side-panel
+    # label display) can stay in sync without polling every mouse move
+    selection_changed = Signal()
+
     def __init__(self, viewer: napari.Viewer) -> None:
         super().__init__()
         self.viewer = viewer
@@ -58,6 +64,9 @@ class TimelineWidget(QWidget):
         self.features: np.ndarray | None = None
         self.feature_group_sizes: list[tuple[str, int]] | None = None
         self.class_colors: dict[str, str] = {}
+        # (lo, hi) inclusive frame range picked via Shift+drag on the timeline, for
+        # one-shot bout labeling; None when nothing is selected
+        self.selection: tuple[int, int] | None = None
         # all three keyed by feature-group name
         self.group_colormap: dict[str, str] = {}
         self.group_vmin: dict[str, np.ndarray | None] = {}
@@ -73,7 +82,7 @@ class TimelineWidget(QWidget):
         controls_row.addWidget(self.reset_zoom_button)
 
         controls_row.addStretch()
-        controls_row.addWidget(QLabel("Ctrl+scroll: zoom  |  Ctrl+drag: pan"))
+        controls_row.addWidget(QLabel("Ctrl+scroll: zoom  |  Ctrl+drag: pan  |  Shift+drag: select range"))
         # stretch 0: the controls row keeps its natural (small) height even as the dock grows
         outer_layout.addLayout(controls_row, 0)
 
@@ -102,6 +111,7 @@ class TimelineWidget(QWidget):
             self.view_end = n_frames
             self.group_vmin = {}
             self.group_vmax = {}
+            self.selection = None
         for name, _count in feature_group_sizes or []:
             self.group_colormap.setdefault(name, _DEFAULT_GROUP_COLORMAP.get(name, timeline.DEFAULT_COLORMAP))
 
@@ -124,6 +134,22 @@ class TimelineWidget(QWidget):
                 return self.features[offset : offset + count]
             offset += count
         return None
+
+    def set_selection(self, start_frame: int, end_frame: int) -> None:
+        if self.n_frames == 0:
+            return
+        lo, hi = sorted((start_frame, end_frame))
+        lo = max(0, min(lo, self.n_frames - 1))
+        hi = max(0, min(hi, self.n_frames - 1))
+        self.selection = (lo, hi)
+        self.selection_changed.emit()
+        self.canvas.update()
+
+    def clear_selection(self) -> None:
+        if self.selection is not None:
+            self.selection = None
+            self.selection_changed.emit()
+            self.canvas.update()
 
     def _on_reset_zoom_clicked(self) -> None:
         self.view_start = 0
@@ -159,6 +185,8 @@ class _TimelineCanvas(QWidget):
         self._panning = False
         self._pan_start_x = 0.0
         self._pan_start_view = (0, 0)
+        self._selecting = False
+        self._selection_anchor_frame = 0
         self._group_controls: dict[str, tuple[QComboBox, QPushButton]] = {}
         self.setCursor(Qt.CursorShape.PointingHandCursor)
 
@@ -234,6 +262,14 @@ class _TimelineCanvas(QWidget):
 
         view_start, view_end = self.owner.view_start, self.owner.view_end
         data_width = max(self.width() - LABEL_WIDTH, 1)
+        if self.owner.n_frames > 0 and view_end > view_start and self.owner.selection is not None:
+            sel_lo, sel_hi = self.owner.selection
+            if sel_hi >= view_start and sel_lo < view_end:
+                view_width = view_end - view_start
+                x0 = LABEL_WIDTH + (max(sel_lo, view_start) - view_start) / view_width * data_width
+                x1 = LABEL_WIDTH + (min(sel_hi, view_end - 1) + 1 - view_start) / view_width * data_width
+                painter.fillRect(QRectF(x0, 0, x1 - x0, self.height()), QColor(*SELECTION_FILL_COLOR))
+
         if self.owner.n_frames > 0 and view_end > view_start:
             frame = int(self.owner.viewer.dims.current_step[0])
             if view_start <= frame < view_end:
@@ -333,16 +369,27 @@ class _TimelineCanvas(QWidget):
 
     def mousePressEvent(self, event: QMouseEvent) -> None:
         if event.position().x() < LABEL_WIDTH:
-            return  # clicks on the row-label margin don't seek/pan
+            return  # clicks on the row-label margin don't seek/pan/select
+        if event.button() == Qt.MouseButton.LeftButton and (event.modifiers() & Qt.KeyboardModifier.ShiftModifier):
+            self._selecting = True
+            self._selection_anchor_frame = self._frame_at_x(event.position().x())
+            self.owner.set_selection(self._selection_anchor_frame, self._selection_anchor_frame)
+            event.accept()
+            return
         if event.button() == Qt.MouseButton.LeftButton and (event.modifiers() & Qt.KeyboardModifier.ControlModifier):
             self._panning = True
             self._pan_start_x = event.position().x()
             self._pan_start_view = (self.owner.view_start, self.owner.view_end)
             event.accept()
             return
+        self.owner.clear_selection()
         self._seek_to_x(event.position().x())
 
     def mouseMoveEvent(self, event: QMouseEvent) -> None:
+        if self._selecting and (event.buttons() & Qt.MouseButton.LeftButton):
+            self.owner.set_selection(self._selection_anchor_frame, self._frame_at_x(event.position().x()))
+            event.accept()
+            return
         if self._panning and (event.buttons() & Qt.MouseButton.LeftButton):
             self._update_pan(event.position().x())
             event.accept()
@@ -351,9 +398,17 @@ class _TimelineCanvas(QWidget):
             self._seek_to_x(event.position().x())
 
     def mouseReleaseEvent(self, event: QMouseEvent) -> None:
+        if self._selecting:
+            self._selecting = False
+            event.accept()
+            return
         if self._panning:
             self._panning = False
             event.accept()
+
+    def _frame_at_x(self, x: float) -> int:
+        data_width = max(self.width() - LABEL_WIDTH, 1)
+        return timeline.frame_for_x(x - LABEL_WIDTH, data_width, self.owner.view_start, self.owner.view_end)
 
     def _update_pan(self, current_x: float) -> None:
         owner = self.owner
@@ -400,6 +455,4 @@ class _TimelineCanvas(QWidget):
         event.accept()
 
     def _seek_to_x(self, x: float) -> None:
-        data_width = max(self.width() - LABEL_WIDTH, 1)
-        frame = timeline.frame_for_x(x - LABEL_WIDTH, data_width, self.owner.view_start, self.owner.view_end)
-        self.owner.viewer.dims.set_current_step(0, frame)
+        self.owner.viewer.dims.set_current_step(0, self._frame_at_x(x))

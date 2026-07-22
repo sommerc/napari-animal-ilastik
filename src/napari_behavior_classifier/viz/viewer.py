@@ -25,11 +25,21 @@ DEFAULT_BOX_COLOR = "cyan"
 
 # A manual annotation gets a thicker box outline than a model prediction, since
 # both otherwise share the same per-class color palette and would be
-# indistinguishable at a glance.
+# indistinguishable at a glance. The individual currently selected in the dropdown
+# gets a further width bonus on top of either - real "bold", via the box outline
+# itself, rather than text styling (napari's Shapes/Points TextManager has no
+# font-weight field and its `size` is a single value for the whole layer, so per-item
+# bold text isn't possible - but edge_width is a genuine per-item property).
 ANNOTATION_EDGE_WIDTH = 4.0
 PREDICTION_EDGE_WIDTH = 1.5
+ACTIVE_BOX_EXTRA_WIDTH = 3.0
+
+BOX_LABEL_FONT_SIZE = 10
+BOX_LABEL_COLOR = "white"
+BOX_LABEL_TRANSLATION = [-8, 0]
 
 GetBoxStyle = Callable[[str, int], tuple[str, float]]
+GetActiveIndividual = Callable[[], str]
 
 
 @dataclass
@@ -62,10 +72,12 @@ def build_layers(
     data: ProjectData,
     viewer: napari.Viewer,
     get_box_style: GetBoxStyle | None = None,
+    get_active_individual: GetActiveIndividual | None = None,
 ) -> ProjectLayers:
     """Add fresh napari layers for already-parsed ProjectData. Cheap - safe to call on every file switch."""
     ds = data.ds
     get_box_style = get_box_style or (lambda individual, frame: (DEFAULT_BOX_COLOR, PREDICTION_EDGE_WIDTH))
+    get_active_individual = get_active_individual or (lambda: "")
 
     image_layer = viewer.add_image(data.video, name=Path(ds.attrs["video_path"]).name, colormap="gray")
 
@@ -90,6 +102,14 @@ def build_layers(
         edge_color=DEFAULT_BOX_COLOR,
         face_color="transparent",
         edge_width=PREDICTION_EDGE_WIDTH,
+        properties={"individual": np.array([], dtype=object)},
+        text={
+            "string": "{individual}",
+            "size": BOX_LABEL_FONT_SIZE,
+            "color": BOX_LABEL_COLOR,
+            "anchor": "upper_left",
+            "translation": BOX_LABEL_TRANSLATION,
+        },
     )
 
     def refresh(event=None) -> None:
@@ -108,9 +128,14 @@ def build_layers(
         bbox_layer.data = [box for _, box in boxes]
         if boxes:
             bbox_layer.shape_type = ["rectangle"] * len(boxes)
+            bbox_layer.properties = {"individual": np.array([individual for individual, _ in boxes], dtype=object)}
+            active_individual = get_active_individual()
             styles = [get_box_style(individual, frame) for individual, _ in boxes]
             bbox_layer.edge_color = [color for color, _ in styles]
-            bbox_layer.edge_width = [width for _, width in styles]
+            bbox_layer.edge_width = [
+                width + (ACTIVE_BOX_EXTRA_WIDTH if individual == active_individual else 0)
+                for (individual, _box), (_color, width) in zip(boxes, styles)
+            ]
 
     viewer.dims.events.current_step.connect(refresh)
     refresh()

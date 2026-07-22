@@ -36,6 +36,6 @@ def load_session(path: str | Path) -> tuple[list[str], LabelStore, dict[str, str
 
     store = LabelStore()
     for row in data.get("labels", []):
-        store.labels[(row["source_file"], row["individual"], row["frame"])] = row["class"]
+        store.set(row["source_file"], row["individual"], row["frame"], row["class"])
 
     return data.get("h5_paths", []), store, data.get("class_colors", {})

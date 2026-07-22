@@ -12,6 +12,7 @@ dependencies = [
     "magicgui>=0.10.2",
     "napari[pyqt]>=0.8.0",
     "opencv-python-headless>=4.0",
+    "pandas>=2.0.0",
     "scikit-image>=0.26.0",
     "scikit-learn>=1.9.0",
     "sleap-io>=0.9.1",
@@ -20,6 +21,10 @@ dependencies = [
 
 [project.entry-points."napari.manifest"]
 napari-behavior-classifier = "napari_behavior_classifier:napari.yaml"
+
+[project.scripts]
+napari-behavior-train = "napari_behavior_classifier.cli.train:main"
+napari-behavior-predict = "napari_behavior_classifier.cli.predict:main"
 
 [build-system]
 requires = ["hatchling"]
