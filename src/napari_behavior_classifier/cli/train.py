@@ -65,7 +65,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Training failed: {e}", file=sys.stderr)
         return 1
 
-    api.save_pipeline(result.pipeline, args.model_out)
+    api.save_pipeline(result.pipeline, args.model_out, result.feature_names, result.feature_selection)
 
     print(format_report(result))
     print(f"\nSaved model to {args.model_out}")

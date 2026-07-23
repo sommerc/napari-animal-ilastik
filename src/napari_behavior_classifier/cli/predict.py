@@ -28,10 +28,10 @@ def main(argv: list[str] | None = None) -> int:
     )
     args = parser.parse_args(argv)
 
-    pipeline = api.load_pipeline(args.model)
+    model = api.load_pipeline(args.model)
 
     for h5_path in args.h5_paths:
-        predictions = api.predict_file_all_individuals(pipeline, h5_path)
+        predictions = api.predict_file_all_individuals(model, h5_path)
         rows = [
             (h5_path.name, individual, frame, class_name)
             for individual, preds in predictions.items()

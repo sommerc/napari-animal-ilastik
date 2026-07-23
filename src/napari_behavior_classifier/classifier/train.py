@@ -18,6 +18,8 @@ from sklearn.metrics import confusion_matrix, precision_recall_fscore_support
 from sklearn.pipeline import Pipeline, make_pipeline
 from sklearn.preprocessing import StandardScaler
 
+from ..features.selection import FeatureSelection
+
 
 def build_pipeline() -> Pipeline:
     return make_pipeline(
@@ -99,9 +101,35 @@ def oob_summary(pipeline: Pipeline, features: np.ndarray, labels_by_frame: dict[
     )
 
 
-def save_pipeline(pipeline: Pipeline, path: str | Path) -> None:
-    joblib.dump(pipeline, path)
+@dataclass
+class SavedModel:
+    """A fitted pipeline plus the feature configuration that produced its inputs -
+    needed to recompute the exact same feature vector (shape and column order)
+    when predicting later, since the live session's own feature selection may
+    have changed since this model was trained."""
+
+    pipeline: Pipeline
+    feature_names: list[str]
+    feature_selection: FeatureSelection
 
 
-def load_pipeline(path: str | Path) -> Pipeline:
-    return joblib.load(path)
+def save_pipeline(
+    pipeline: Pipeline, path: str | Path, feature_names: list[str], feature_selection: FeatureSelection
+) -> None:
+    joblib.dump(
+        {
+            "pipeline": pipeline,
+            "feature_names": feature_names,
+            "feature_selection": feature_selection.to_dict(),
+        },
+        path,
+    )
+
+
+def load_pipeline(path: str | Path) -> SavedModel:
+    data = joblib.load(path)
+    return SavedModel(
+        pipeline=data["pipeline"],
+        feature_names=data["feature_names"],
+        feature_selection=FeatureSelection.from_dict(data["feature_selection"]),
+    )

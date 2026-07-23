@@ -31,8 +31,10 @@ from qtpy.QtWidgets import (
 from .annotation.store import LabelStore
 from .classifier import train as train_module
 from .features import filterbank, kinematics
+from .features.selection import FeatureSelection, compute_selected_features
 from .io.h5_reader import Skeleton, check_consistent_skeleton, extract_skeleton
 from .session import load_session, save_session
+from .viz.feature_selection_dialog import SelectFeaturesDialog
 from .viz.timeline_widget import TimelineWidget
 from .viz.viewer import (
     ANNOTATION_EDGE_WIDTH,
@@ -153,11 +155,23 @@ class BehaviorClassifierWidget(QWidget):
         self._clear_shortcut.activated.connect(self._on_clear_label)
         self._class_colors: dict[str, str] = {}
         self._raw_features_cache: dict[tuple[str, str], list[kinematics.FeatureGroup]] = {}
-        self._combined_features_cache: dict[tuple[str, str], tuple[np.ndarray, list[str]]] = {}
+        # keyed by (source_file, individual, selection.cache_key()) - a selection change
+        # doesn't need to evict anything, just naturally misses and recomputes
+        self._combined_features_cache: dict[tuple, tuple[np.ndarray, list[str]]] = {}
+        self._feature_selection = FeatureSelection.all_enabled(
+            [name for name, _ in kinematics.FEATURE_GROUPS], filterbank.DEFAULT_SIGMAS
+        )
         # one shared model: classes are monadic (a class label means the same thing
         # regardless of which tracked animal it's attached to), so training pools
         # labeled frames across every individual and every open file into one pipeline
         self._monadic_pipeline: object | None = None
+        # the selection/names that actually produced self._monadic_pipeline's inputs -
+        # deliberately a separate snapshot from self._feature_selection, since the user
+        # can reopen "Select features..." and change it after training but before
+        # predicting/saving; predicting must replay the selection the model was
+        # trained on, not whatever the dialog says right now
+        self._trained_feature_selection: FeatureSelection | None = None
+        self._trained_feature_names: list[str] | None = None
         self._predictions: dict[tuple[str, str], np.ndarray] = {}  # keyed by (source_file, individual)
         self._session_path: str | None = None  # set on save/load; lets "Save session" skip the dialog
 
@@ -239,6 +253,10 @@ class BehaviorClassifierWidget(QWidget):
         annotations_io_row.addWidget(self.save_annotations_button)
         annotations_io_row.addWidget(self.load_annotations_button)
         layout.addLayout(annotations_io_row)
+
+        self.select_features_button = QPushButton("Select features...")
+        self.select_features_button.clicked.connect(self._on_select_features_clicked)
+        layout.addWidget(self.select_features_button)
 
         self.train_predict_button = QPushButton("Train + Predict")
         self.train_predict_button.clicked.connect(self._on_train_and_predict_clicked)
@@ -511,6 +529,11 @@ class BehaviorClassifierWidget(QWidget):
 
     # -- features / training --
 
+    def _on_select_features_clicked(self) -> None:
+        dialog = SelectFeaturesDialog(self, self._feature_selection, filterbank.DEFAULT_SIGMAS)
+        if dialog.exec() == QDialog.DialogCode.Accepted:
+            self._feature_selection = dialog.selection
+
     def _get_raw_feature_groups(self, source_file: str, individual: str) -> list[kinematics.FeatureGroup]:
         key = (source_file, individual)
         if key not in self._raw_features_cache:
@@ -518,11 +541,13 @@ class BehaviorClassifierWidget(QWidget):
             self._raw_features_cache[key] = kinematics.compute_feature_groups(ds, individual)
         return self._raw_features_cache[key]
 
-    def _get_combined_features(self, source_file: str, individual: str) -> tuple[np.ndarray, list[str]]:
-        key = (source_file, individual)
+    def _get_combined_features(
+        self, source_file: str, individual: str, selection: FeatureSelection
+    ) -> tuple[np.ndarray, list[str]]:
+        key = (source_file, individual, selection.cache_key())
         if key not in self._combined_features_cache:
-            raw_features, raw_names = kinematics.flatten_feature_groups(self._get_raw_feature_groups(source_file, individual))
-            self._combined_features_cache[key] = filterbank.with_filter_bank(raw_features, raw_names)
+            groups = self._get_raw_feature_groups(source_file, individual)
+            self._combined_features_cache[key] = compute_selected_features(groups, selection)
         return self._combined_features_cache[key]
 
     def _on_train_and_predict_clicked(self) -> None:
@@ -538,6 +563,7 @@ class BehaviorClassifierWidget(QWidget):
         all_features = []
         all_labels: dict[int, str] = {}
         offset = 0
+        feature_names: list[str] = []
         contributing_individuals: set[str] = set()
         contributing_files: set[str] = set()
 
@@ -547,7 +573,7 @@ class BehaviorClassifierWidget(QWidget):
                 labeled_frames = self.store.labeled_frames(source_file, individual)
                 if not labeled_frames:
                     continue
-                features, _names = self._get_combined_features(source_file, individual)
+                features, feature_names = self._get_combined_features(source_file, individual, self._feature_selection)
                 for frame in labeled_frames:
                     all_labels[offset + frame] = self.store.get(source_file, individual, frame)
                 all_features.append(features)
@@ -558,10 +584,15 @@ class BehaviorClassifierWidget(QWidget):
         if len(set(all_labels.values())) < 2:
             self.status_label.setText("Need labeled frames from at least 2 classes, across any animals/files")
             return False
+        if not feature_names:
+            self.status_label.setText("No feature groups/scales selected - use \"Select features...\" first")
+            return False
 
         combined = np.concatenate(all_features, axis=1)
         pipeline = train_module.train(combined, all_labels)
         self._monadic_pipeline = pipeline
+        self._trained_feature_selection = self._feature_selection.copy()
+        self._trained_feature_names = feature_names
         report = train_module.oob_summary(pipeline, combined, all_labels)
 
         message = (
@@ -579,23 +610,27 @@ class BehaviorClassifierWidget(QWidget):
         ).exec()
         return True
 
-    def _predict_all_open_files(self, pipeline) -> int:
-        """Predict every individual across every open file with the shared monadic model."""
+    def _predict_all_open_files(self, pipeline, selection: FeatureSelection) -> int:
+        """Predict every individual across every open file with the shared monadic model.
+        `selection` is the feature selection the model was *trained* with - not
+        necessarily today's live `self._feature_selection` (the user may have reopened
+        "Select features..." since training) - a mismatch would feed the model a
+        differently-shaped/ordered feature vector than it was fit on."""
         n_predicted = 0
         for source_file, open_file in self.open_files.items():
             individuals = [str(v) for v in open_file.data.ds.coords["individuals"].values]
             for individual in individuals:
-                features, _names = self._get_combined_features(source_file, individual)
+                features, _names = self._get_combined_features(source_file, individual, selection)
                 self._predictions[(source_file, individual)] = train_module.predict(pipeline, features)
                 n_predicted += 1
         return n_predicted
 
     def _on_predict_clicked(self) -> None:
-        if self._monadic_pipeline is None:
+        if self._monadic_pipeline is None or self._trained_feature_selection is None:
             self.status_label.setText("No trained (or loaded) model yet")
             return
 
-        n_predicted = self._predict_all_open_files(self._monadic_pipeline)
+        n_predicted = self._predict_all_open_files(self._monadic_pipeline, self._trained_feature_selection)
         message = f"Predicted on {n_predicted} animal track(s)"
         self.status_label.setText(message)
         show_info(message)
@@ -607,12 +642,14 @@ class BehaviorClassifierWidget(QWidget):
     def _on_export_model_clicked(self) -> None:
         """Export-only: the model is meant for later batch processing (e.g. via `api.py`
         or another tool), not for loading back into this widget."""
-        if self._monadic_pipeline is None:
+        if self._monadic_pipeline is None or self._trained_feature_selection is None or self._trained_feature_names is None:
             self.status_label.setText("Train a model before exporting it")
             return
         path, _ = QFileDialog.getSaveFileName(self, "Export model", "", "Model files (*.joblib)")
         if path:
-            train_module.save_pipeline(self._monadic_pipeline, path)
+            train_module.save_pipeline(
+                self._monadic_pipeline, path, self._trained_feature_names, self._trained_feature_selection
+            )
             self.status_label.setText(f"Exported model to {Path(path).name}")
 
     def _on_export_predictions_clicked(self) -> None:
@@ -648,8 +685,14 @@ class BehaviorClassifierWidget(QWidget):
         model_filename = None
         if self._monadic_pipeline is not None:
             model_filename = Path(path).stem + ".joblib"
-            train_module.save_pipeline(self._monadic_pipeline, Path(path).with_name(model_filename))
-        save_session(path, list(self.open_files.keys()), self.store, self._class_colors, model_filename)
+            train_module.save_pipeline(
+                self._monadic_pipeline, Path(path).with_name(model_filename),
+                self._trained_feature_names, self._trained_feature_selection,
+            )
+        save_session(
+            path, list(self.open_files.keys()), self.store, self._class_colors, model_filename,
+            self._feature_selection,
+        )
         self._session_path = path
         suffix = f" (+ model {model_filename})" if model_filename else ""
         self.status_label.setText(f"Saved session to {Path(path).name}{suffix}")
@@ -658,9 +701,12 @@ class BehaviorClassifierWidget(QWidget):
         path, _ = QFileDialog.getOpenFileName(self, "Load session", "", "Session files (*.json)")
         if not path:
             return
-        h5_paths, store, class_colors, model_filename = load_session(path)
+        h5_paths, store, class_colors, model_filename, feature_selection = load_session(path)
         self.store = store
         self._session_path = path
+        self._feature_selection = feature_selection or FeatureSelection.all_enabled(
+            [name for name, _ in kinematics.FEATURE_GROUPS], filterbank.DEFAULT_SIGMAS
+        )
 
         self.class_list.clear()
         self._class_colors = {}
@@ -673,11 +719,16 @@ class BehaviorClassifierWidget(QWidget):
             self.open_file(h5_path)
 
         self._monadic_pipeline = None
+        self._trained_feature_selection = None
+        self._trained_feature_names = None
         status = f"Loaded session from {Path(path).name}"
         if model_filename:
             model_path = Path(path).with_name(model_filename)
             if model_path.exists():
-                self._monadic_pipeline = train_module.load_pipeline(model_path)
+                saved_model = train_module.load_pipeline(model_path)
+                self._monadic_pipeline = saved_model.pipeline
+                self._trained_feature_selection = saved_model.feature_selection
+                self._trained_feature_names = saved_model.feature_names
                 status += " (+ model)"
             else:
                 status += f" - linked model {model_filename} not found"
@@ -707,7 +758,12 @@ class BehaviorClassifierWidget(QWidget):
 
         self._raw_features_cache.clear()
         self._combined_features_cache.clear()
+        self._feature_selection = FeatureSelection.all_enabled(
+            [name for name, _ in kinematics.FEATURE_GROUPS], filterbank.DEFAULT_SIGMAS
+        )
         self._monadic_pipeline = None
+        self._trained_feature_selection = None
+        self._trained_feature_names = None
         self._predictions.clear()
         self._session_path = None
 
