@@ -21,7 +21,7 @@ from ..io.h5_reader import load_tracks
 from ..io.video import LazyVideoFrames, load_video_frames
 from . import layers
 
-DEFAULT_BOX_COLOR = "cyan"
+DEFAULT_BOX_COLOR = "yellow"
 
 # A manual annotation gets a thicker box outline than a model prediction, since
 # both otherwise share the same per-class color palette and would be
@@ -34,9 +34,10 @@ ANNOTATION_EDGE_WIDTH = 2.0
 PREDICTION_EDGE_WIDTH = 0.75
 ACTIVE_BOX_EXTRA_WIDTH = 1.5
 
-# Points markers stay a fixed on-screen size regardless of zoom (min == max
-# pins it exactly), matching the `size=3` below rather than scaling with it.
-POINT_CANVAS_SIZE = 3
+# Body-part points and skeleton lines share this width, in real-world (data)
+# coordinates - both scale with zoom together, so points read as part of the
+# same skeleton rather than a mismatched fixed-pixel overlay.
+SKELETON_LINE_WIDTH = 2
 
 BOX_LABEL_FONT_SIZE = 10
 BOX_LABEL_FALLBACK_COLOR = "white"  # used only before any box has a real color (e.g. no boxes yet)
@@ -85,20 +86,21 @@ def build_layers(
 
     image_layer = viewer.add_image(data.video, name=Path(ds.attrs["video_path"]).name, colormap="gray")
 
-    points_layer = viewer.add_points(
-        np.empty((0, 2), dtype=np.float32),
-        name="bodyparts",
-        size=3,
-        face_color="white",
-        border_width=0,
-        canvas_size_limits=(POINT_CANVAS_SIZE, POINT_CANVAS_SIZE),
-    )
+    # Added before points (below), since later-added layers render in front -
+    # keeps body-part points visible on top of the skeleton lines.
     skeleton_layer = viewer.add_shapes(
         [],
         shape_type="line",
         name="skeleton",
         edge_color="yellow",
-        edge_width=2,
+        edge_width=SKELETON_LINE_WIDTH,
+    )
+    points_layer = viewer.add_points(
+        np.empty((0, 2), dtype=np.float32),
+        name="bodyparts",
+        size=SKELETON_LINE_WIDTH,
+        face_color="white",
+        border_width=0,
     )
     bbox_layer = viewer.add_shapes(
         [],
@@ -130,6 +132,9 @@ def build_layers(
         skeleton_layer.data = skeleton_lines
         if skeleton_lines:
             skeleton_layer.shape_type = ["line"] * len(skeleton_lines)
+            # Shapes resets edge_width to its default on every `.data =` assignment
+            # (unlike Points.size, which persists) - reapply it every frame.
+            skeleton_layer.edge_width = [SKELETON_LINE_WIDTH] * len(skeleton_lines)
 
         boxes = layers.frame_bboxes(ds, frame)
         bbox_layer.data = [box for _, box in boxes]

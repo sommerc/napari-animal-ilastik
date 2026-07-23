@@ -9,7 +9,7 @@ import numpy as np
 import pandas as pd
 from napari.utils.notifications import show_info
 from qtpy.QtCore import Qt
-from qtpy.QtGui import QColor, QKeySequence, QShortcut
+from qtpy.QtGui import QColor, QFont, QKeySequence, QShortcut
 from qtpy.QtWidgets import (
     QApplication,
     QComboBox,
@@ -45,9 +45,11 @@ from .viz.viewer import (
     remove_layers,
 )
 
+# red, green, blue, cyan, magenta, yellow (darker - #ffe119 is too washed out
+# against a light list background), purple, orange, pink, brown
 _CLASS_COLORS = [
-    "#e6194b", "#3cb44b", "#ffe119", "#4363d8", "#f58231",
-    "#911eb4", "#46f0f0", "#f032e6", "#bcf60c",
+    "#e6194b", "#3cb44b", "#4363d8", "#46f0f0", "#f032e6",
+    "#FF9100", "#911eb4", "#f58231", "#f5c8d9", "#9a6324",
 ]
 
 
@@ -376,16 +378,22 @@ class BehaviorClassifierWidget(QWidget):
 
     # -- classes --
 
+    def _new_class_list_item(self, name: str, color: str) -> QListWidgetItem:
+        item = QListWidgetItem(f"{self.class_list.count() + 1}. {name}")
+        item.setBackground(QColor(color))
+        font = item.font()
+        font.setBold(True)
+        item.setFont(font)
+        item.setData(Qt.ItemDataRole.UserRole, name)
+        return item
+
     def _on_add_class(self) -> None:
         name = self.new_class_edit.text().strip()
         if not name or name in self._class_names():
             return
         color = _CLASS_COLORS[len(self._class_colors) % len(_CLASS_COLORS)]
         self._class_colors[name] = color
-        item = QListWidgetItem(f"{self.class_list.count() + 1}. {name}")
-        item.setBackground(QColor(color))
-        item.setData(Qt.ItemDataRole.UserRole, name)
-        self.class_list.addItem(item)
+        self.class_list.addItem(self._new_class_list_item(name, color))
         self.new_class_edit.clear()
         self._rebind_hotkeys()
         self._refresh_timeline()
@@ -658,10 +666,7 @@ class BehaviorClassifierWidget(QWidget):
         self._class_colors = {}
         for name, color in class_colors.items():
             self._class_colors[name] = color
-            item = QListWidgetItem(f"{self.class_list.count() + 1}. {name}")
-            item.setBackground(QColor(color))
-            item.setData(Qt.ItemDataRole.UserRole, name)
-            self.class_list.addItem(item)
+            self.class_list.addItem(self._new_class_list_item(name, color))
         self._rebind_hotkeys()
 
         for h5_path in h5_paths:
