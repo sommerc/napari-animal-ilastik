@@ -8,24 +8,22 @@ single long function. The grouping is also what lets the feature-map
 visualization draw a labeled, gapped section per group instead of one
 undifferentiated stack of rows.
 
-Angles are ordered by walking the skeleton graph (see `discover_chains()`)
-rather than raw node index, so a chain like a tail or a limb (root to tip)
-lands as a contiguous, anatomically-ordered run of rows. That matters for
-the feature-map heatmap: a periodic behavior (a tail beat) shows up as a
-visible traveling wave down the chain instead of being scrambled by
-whatever order the skeleton happened to be authored in. Chains are walked
-starting only from degree-1 endpoint nodes, so anything with no endpoint to
-walk from - a cycle (e.g. two eye nodes and the head forming a triangle), or
-a direct branch-to-branch edge with no chain nodes in between - has no
-natural walk direction and instead keeps the skeleton's original node-index
-order, appended after every discovered chain (`_chain_ordered_angle_triples`).
-Segment angles are computed at any node with exactly two neighbors (a chain
-joint), since a 3+-way junction has no single well-defined bend. Distances
-are deliberately *not* chain-reordered - a bone length doesn't carry a "walk
-direction" the way an angle does, so they're just listed in the skeleton's
-own edge order (see `compute_distances`). Speeds are simple frame-to-frame
-displacements, not smoothed - smoothing/derivative filters belong to the
-filter bank, not here.
+The registered "Angles" group is `compute_node_angles`: the interior angle at
+every node with 2+ neighbors, junctions included, ordered by the node's own
+name (alphabetical) and named `angle_{node}_{neighborA}_{neighborB}`. An
+earlier chain-walk approach (`compute_angles`, degree-2 chain nodes only,
+ordered by walking the skeleton graph via `discover_chains()` so a tail or
+limb chain lands as a contiguous, anatomically-ordered run of rows) is kept
+in this module but deliberately unregistered - it doesn't handle junctions,
+which `compute_node_angles` was written to cover. Distances are deliberately
+*not* chain- or name-reordered - a bone length doesn't carry the same
+positional meaning an angle does, so they're just listed in the skeleton's
+own edge order (see `compute_distances`). Speeds and angular velocities are
+simple frame-to-frame differences, not smoothed - smoothing/derivative
+filters belong to the filter bank, not here. Angular velocity is each node's
+signed rotation rate around the whole-body centroid (see
+`compute_angular_velocities`), ordered by raw node index like speed, for the
+same reason: each row depends only on that one node, not a neighbor.
 """
 
 from __future__ import annotations
@@ -156,6 +154,57 @@ def compute_angles(ds: xr.Dataset, individual: str) -> tuple[np.ndarray, list[st
     return np.stack(rows, axis=0).astype(np.float32), names
 
 
+def compute_node_angles(ds: xr.Dataset, individual: str) -> tuple[np.ndarray, list[str]]:
+    """Signed angle at every joint with 2+ neighbors - any junction, not just the
+    degree-2 chain nodes `compute_angles` (kept, unregistered) is limited to - in
+    [-180, 180] degrees.
+
+    This is the plain interior angle between two edges meeting at the node (180 =
+    colinear/straight, 0 = folded flat back onto itself) rather than a chain "bend"
+    computed from a prev->node->next walk, so it needs no walk direction and applies
+    just as well at a 3+-way junction as at a simple chain joint. A degree-2 node has
+    only one possible neighbor pair and gets exactly one angle; a junction with more
+    neighbors has no single natural pair, so it gets one angle per *consecutive* pair
+    when its neighbors are sorted by skeleton body-part index - e.g. a 3-neighbor
+    junction gets 2 angles (neighbor0-neighbor1, neighbor1-neighbor2), not all 3
+    possible pairs.
+
+    Rows are ordered by the node's own name first (plain alphabetical sort, no chain
+    walk), then - for a junction contributing more than one angle - by ascending
+    neighbor body-part index, matching the `angle_{node}_{neighborA}_{neighborB}`
+    name each row gets.
+    """
+    pos = ds["position"].sel(individuals=individual).values  # (time, keypoints, 2)
+    node_names = list(ds.coords["keypoints"].values)
+    edges = ds.attrs["skeleton_edges"]
+    n_nodes = len(node_names)
+
+    adjacency = _node_adjacency(edges, n_nodes)
+
+    rows: list[np.ndarray] = []
+    names: list[str] = []
+    for node in sorted(range(n_nodes), key=lambda i: node_names[i]):
+        neighbors = sorted(adjacency[node])
+        for a, b in zip(neighbors, neighbors[1:]):
+            v1 = pos[:, a] - pos[:, node]
+            v2 = pos[:, b] - pos[:, node]
+            # atan2(cross, dot) rather than arccos+sign: arccos's magnitude hits
+            # exactly 180 deg at the colinear/straight case, where the sign trick
+            # used by `compute_angles` degenerates to exactly 0 (cross product of
+            # parallel/anti-parallel vectors is 0) - multiplying a genuine 180 by
+            # a degenerate 0 sign would wrongly collapse it to 0. atan2 gives the
+            # signed angle directly and handles every case (including this one)
+            # continuously, with no separate degenerate sign computation.
+            cross = v1[..., 0] * v2[..., 1] - v1[..., 1] * v2[..., 0]
+            dot = np.sum(v1 * v2, axis=-1)
+            angle = np.degrees(np.arctan2(cross, dot))
+
+            rows.append(angle)
+            names.append(f"angle_{node_names[node]}_{node_names[a]}_{node_names[b]}")
+
+    return np.stack(rows, axis=0).astype(np.float32), names
+
+
 def _chain_ordered_angle_triples(edges: list[tuple[int, int]], n_nodes: int) -> list[tuple[int, int, int]]:
     """(prev, node, next) for every degree-2 node, chains first (in walk order), then
     any node no chain reaches - those keep the original node-index order/neighbors
@@ -176,6 +225,33 @@ def _chain_ordered_angle_triples(edges: list[tuple[int, int]], n_nodes: int) -> 
             triples.append((prev_node, node, next_node))
 
     return triples
+
+
+def compute_angular_velocities(ds: xr.Dataset, individual: str) -> tuple[np.ndarray, list[str]]:
+    """Signed frame-to-frame angular velocity of each node around the whole-body
+    centroid, in degrees/frame (0 = not revolving around the centroid this frame;
+    positive = counterclockwise in the data's own x/y axes - plain atan2 sign
+    convention, no relation to `compute_angles`'s cross-product-based sign).
+
+    No dedicated "central" node is needed: the centroid is the same
+    all-body-parts nanmean already used for `speed_centroid` below, so this
+    works unmodified on any skeleton. Node order is the skeleton's raw
+    node-index order (like speed), not chain-walked (like angles) - each row
+    only depends on that one node's position relative to the centroid, not on
+    any neighboring node, so there's no "walk direction" for a chain to impose.
+    """
+    pos = ds["position"].sel(individuals=individual).values  # (time, keypoints, 2)
+    node_names = list(ds.coords["keypoints"].values)
+
+    centroid = np.nanmean(pos, axis=1)  # (time, 2)
+    relative = pos - centroid[:, None, :]  # (time, keypoints, 2): centroid -> node
+
+    angle = np.degrees(np.arctan2(relative[..., 1], relative[..., 0]))  # (time, keypoints)
+    delta = np.diff(angle, axis=0, prepend=angle[:1])  # first frame = 0, like _speed()
+    velocity = (delta + 180) % 360 - 180  # shortest signed step, wrapping the +-180 seam
+
+    names = [f"angvel_{name}" for name in node_names]
+    return velocity.T.astype(np.float32), names
 
 
 def compute_speeds(ds: xr.Dataset, individual: str) -> tuple[np.ndarray, list[str]]:
@@ -204,7 +280,11 @@ FeatureComputer = Callable[[xr.Dataset, str], tuple[np.ndarray, list[str]]]
 # here - nothing else in this module needs to change.
 FEATURE_GROUPS: list[tuple[str, FeatureComputer]] = [
     ("Distances", compute_distances),
-    ("Angles", compute_angles),
+    # compute_angles (chain-walk bend angle, degree-2 nodes only) is superseded by
+    # compute_node_angles (any node with 2+ neighbors, junctions included) but kept
+    # unregistered in this module rather than deleted.
+    ("Angles", compute_node_angles),
+    ("Angular velocity", compute_angular_velocities),
     ("Speed", compute_speeds),
 ]
 

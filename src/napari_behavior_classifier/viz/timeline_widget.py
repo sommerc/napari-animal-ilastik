@@ -44,6 +44,7 @@ SELECTION_FILL_COLOR = (255, 255, 0, 60)
 _DEFAULT_GROUP_COLORMAP = {
     "Distances": "viridis",
     "Angles": timeline.DEFAULT_DIVERGING_COLORMAP,
+    "Angular velocity": "PiYG",  # diverging like Angles, but visually distinct from it
     "Speed": "plasma",
 }
 
