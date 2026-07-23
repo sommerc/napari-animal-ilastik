@@ -7,6 +7,7 @@ from pathlib import Path
 import napari
 import numpy as np
 import pandas as pd
+from napari.utils.notifications import show_info
 from qtpy.QtCore import Qt
 from qtpy.QtGui import QColor, QKeySequence, QShortcut
 from qtpy.QtWidgets import (
@@ -156,6 +157,7 @@ class BehaviorClassifierWidget(QWidget):
         # labeled frames across every individual and every open file into one pipeline
         self._monadic_pipeline: object | None = None
         self._predictions: dict[tuple[str, str], np.ndarray] = {}  # keyed by (source_file, individual)
+        self._session_path: str | None = None  # set on save/load; lets "Save session" skip the dialog
 
         self.timeline_widget = TimelineWidget(viewer)
         self.timeline_widget.selection_changed.connect(self._refresh_current_label)
@@ -178,13 +180,20 @@ class BehaviorClassifierWidget(QWidget):
         layout.addWidget(self.remove_file_button)
 
         session_io_row = QHBoxLayout()
-        self.save_session_button = QPushButton("Save session...")
+        self.save_session_button = QPushButton("Save session")
         self.save_session_button.clicked.connect(self._on_save_session_clicked)
+        self.save_session_as_button = QPushButton("Save session as...")
+        self.save_session_as_button.clicked.connect(self._on_save_session_as_clicked)
         self.load_session_button = QPushButton("Load session...")
         self.load_session_button.clicked.connect(self._on_load_session_clicked)
         session_io_row.addWidget(self.save_session_button)
+        session_io_row.addWidget(self.save_session_as_button)
         session_io_row.addWidget(self.load_session_button)
         layout.addLayout(session_io_row)
+
+        self.close_session_button = QPushButton("Close session")
+        self.close_session_button.clicked.connect(self._on_close_session_clicked)
+        layout.addWidget(self.close_session_button)
 
         indiv_row = QHBoxLayout()
         indiv_row.addWidget(QLabel("Individual:"))
@@ -547,12 +556,14 @@ class BehaviorClassifierWidget(QWidget):
         self._monadic_pipeline = pipeline
         report = train_module.oob_summary(pipeline, combined, all_labels)
 
-        self.status_label.setText(
+        message = (
             f"Trained on {len(all_labels)} frames pooled across {len(contributing_individuals)} "
             f"individual(s) in {len(contributing_files)} file(s) "
             f"({len(set(all_labels.values()))} classes, {combined.shape[0]} features)"
             + (f" | OOB accuracy: {report.accuracy:.0%}" if report is not None else "")
         )
+        self.status_label.setText(message)
+        show_info(message)
         class_counts = Counter(all_labels.values())
         file_names = [Path(f).name for f in contributing_files]
         _TrainingSummaryDialog(
@@ -577,7 +588,9 @@ class BehaviorClassifierWidget(QWidget):
             return
 
         n_predicted = self._predict_all_open_files(self._monadic_pipeline)
-        self.status_label.setText(f"Predicted on {n_predicted} animal track(s)")
+        message = f"Predicted on {n_predicted} animal track(s)"
+        self.status_label.setText(message)
+        show_info(message)
 
         if self.active_layers is not None:
             self.active_layers.refresh()
@@ -613,16 +626,33 @@ class BehaviorClassifierWidget(QWidget):
     # -- session (which files + annotations) --
 
     def _on_save_session_clicked(self) -> None:
+        if self._session_path is None:
+            self._on_save_session_as_clicked()
+            return
+        self._save_session_to(self._session_path)
+
+    def _on_save_session_as_clicked(self) -> None:
         path, _ = QFileDialog.getSaveFileName(self, "Save session", "", "Session files (*.json)")
         if path:
-            save_session(path, list(self.open_files.keys()), self.store, self._class_colors)
+            self._save_session_to(path)
+
+    def _save_session_to(self, path: str) -> None:
+        model_filename = None
+        if self._monadic_pipeline is not None:
+            model_filename = Path(path).stem + ".joblib"
+            train_module.save_pipeline(self._monadic_pipeline, Path(path).with_name(model_filename))
+        save_session(path, list(self.open_files.keys()), self.store, self._class_colors, model_filename)
+        self._session_path = path
+        suffix = f" (+ model {model_filename})" if model_filename else ""
+        self.status_label.setText(f"Saved session to {Path(path).name}{suffix}")
 
     def _on_load_session_clicked(self) -> None:
         path, _ = QFileDialog.getOpenFileName(self, "Load session", "", "Session files (*.json)")
         if not path:
             return
-        h5_paths, store, class_colors = load_session(path)
+        h5_paths, store, class_colors, model_filename = load_session(path)
         self.store = store
+        self._session_path = path
 
         self.class_list.clear()
         self._class_colors = {}
@@ -637,8 +667,51 @@ class BehaviorClassifierWidget(QWidget):
         for h5_path in h5_paths:
             self.open_file(h5_path)
 
+        self._monadic_pipeline = None
+        status = f"Loaded session from {Path(path).name}"
+        if model_filename:
+            model_path = Path(path).with_name(model_filename)
+            if model_path.exists():
+                self._monadic_pipeline = train_module.load_pipeline(model_path)
+                status += " (+ model)"
+            else:
+                status += f" - linked model {model_filename} not found"
+        self.status_label.setText(status)
+
         self._refresh_current_label()
         self._refresh_timeline()
+
+    def _on_close_session_clicked(self) -> None:
+        """Return to a fresh, empty state - ready for a different dataset without
+        restarting napari. Does not touch any files already saved to disk."""
+        if self.active_h5_path is not None:
+            layers = self.open_files[self.active_h5_path].layers
+            if layers is not None:
+                remove_layers(self.viewer, layers)
+
+        self.open_files.clear()
+        self.file_list.clear()
+        self.active_h5_path = None
+        self._last_frame.clear()
+        self._reference_skeleton = None
+
+        self.store = LabelStore()
+        self.class_list.clear()
+        self._class_colors.clear()
+        self._rebind_hotkeys()
+
+        self._raw_features_cache.clear()
+        self._combined_features_cache.clear()
+        self._monadic_pipeline = None
+        self._predictions.clear()
+        self._session_path = None
+
+        self.individual_combo.clear()
+        self.current_label_display.setText("Frame: - | Label: -")
+        self.timeline_widget.clear_selection()
+        self.timeline_widget.set_data(0, None, None, None, {})
+
+        self.status_label.setText("Session closed - ready for a new dataset")
 
     # -- timeline --
 

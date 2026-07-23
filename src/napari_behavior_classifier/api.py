@@ -139,7 +139,7 @@ def train_from_files(h5_paths: list[str | Path], annotation_paths: list[str | Pa
 def train_from_session(session_path: str | Path) -> TrainResult:
     """Train one pipeline pooling every file + individual + annotation in a session
     saved via `session.save_session` (see `train_from_files` for the pooling rationale)."""
-    h5_paths, store, _class_colors = load_session(session_path)
+    h5_paths, store, _class_colors, _model_path = load_session(session_path)
 
     all_features = []
     all_labels: dict[int, str] = {}

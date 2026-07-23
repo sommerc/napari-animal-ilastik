@@ -23,7 +23,9 @@ def build_pipeline() -> Pipeline:
     return make_pipeline(
         SimpleImputer(strategy="mean"),
         StandardScaler(),
-        RandomForestClassifier(n_estimators=100, random_state=0, oob_score=True),
+        # n_jobs=-1: parallelize both fit and predict (incl. OOB scoring) across all
+        # available CPU cores - sklearn's default (n_jobs=None) is single-threaded.
+        RandomForestClassifier(n_estimators=100, random_state=0, oob_score=True, n_jobs=-1),
     )
 
 

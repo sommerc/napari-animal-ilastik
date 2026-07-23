@@ -30,12 +30,16 @@ DEFAULT_BOX_COLOR = "cyan"
 # itself, rather than text styling (napari's Shapes/Points TextManager has no
 # font-weight field and its `size` is a single value for the whole layer, so per-item
 # bold text isn't possible - but edge_width is a genuine per-item property).
-ANNOTATION_EDGE_WIDTH = 4.0
-PREDICTION_EDGE_WIDTH = 1.5
-ACTIVE_BOX_EXTRA_WIDTH = 3.0
+ANNOTATION_EDGE_WIDTH = 2.0
+PREDICTION_EDGE_WIDTH = 0.75
+ACTIVE_BOX_EXTRA_WIDTH = 1.5
+
+# Points markers stay a fixed on-screen size regardless of zoom (min == max
+# pins it exactly), matching the `size=3` below rather than scaling with it.
+POINT_CANVAS_SIZE = 3
 
 BOX_LABEL_FONT_SIZE = 10
-BOX_LABEL_COLOR = "white"
+BOX_LABEL_FALLBACK_COLOR = "white"  # used only before any box has a real color (e.g. no boxes yet)
 BOX_LABEL_TRANSLATION = [-8, 0]
 
 GetBoxStyle = Callable[[str, int], tuple[str, float]]
@@ -87,6 +91,7 @@ def build_layers(
         size=3,
         face_color="white",
         border_width=0,
+        canvas_size_limits=(POINT_CANVAS_SIZE, POINT_CANVAS_SIZE),
     )
     skeleton_layer = viewer.add_shapes(
         [],
@@ -102,11 +107,13 @@ def build_layers(
         edge_color=DEFAULT_BOX_COLOR,
         face_color="transparent",
         edge_width=PREDICTION_EDGE_WIDTH,
-        properties={"individual": np.array([], dtype=object)},
+        properties={"individual": np.array([], dtype=object), "box_color": np.array([], dtype=object)},
         text={
             "string": "{individual}",
             "size": BOX_LABEL_FONT_SIZE,
-            "color": BOX_LABEL_COLOR,
+            # tracks each box's current edge color live, via the "box_color" property
+            # kept in sync with edge_color below - not a fixed color.
+            "color": {"feature": "box_color", "fallback": BOX_LABEL_FALLBACK_COLOR},
             "anchor": "upper_left",
             "translation": BOX_LABEL_TRANSLATION,
         },
@@ -128,10 +135,14 @@ def build_layers(
         bbox_layer.data = [box for _, box in boxes]
         if boxes:
             bbox_layer.shape_type = ["rectangle"] * len(boxes)
-            bbox_layer.properties = {"individual": np.array([individual for individual, _ in boxes], dtype=object)}
             active_individual = get_active_individual()
             styles = [get_box_style(individual, frame) for individual, _ in boxes]
-            bbox_layer.edge_color = [color for color, _ in styles]
+            colors = [color for color, _ in styles]
+            bbox_layer.properties = {
+                "individual": np.array([individual for individual, _ in boxes], dtype=object),
+                "box_color": np.array(colors, dtype=object),
+            }
+            bbox_layer.edge_color = colors
             bbox_layer.edge_width = [
                 width + (ACTIVE_BOX_EXTRA_WIDTH if individual == active_individual else 0)
                 for (individual, _box), (_color, width) in zip(boxes, styles)
