@@ -12,6 +12,7 @@ from qtpy.QtCore import QRectF, Qt, Signal
 from qtpy.QtGui import QColor, QImage, QMouseEvent, QPainter, QPen, QPixmap, QResizeEvent, QWheelEvent
 from qtpy.QtWidgets import QComboBox, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
+from ..features import filterbank
 from . import timeline
 
 ANNOTATION_BAR_HEIGHT = 14
@@ -62,8 +63,13 @@ class TimelineWidget(QWidget):
         self.view_end = 0
         self.predictions: np.ndarray | None = None
         self.annotations: np.ndarray | None = None
-        self.features: np.ndarray | None = None
+        self.features: np.ndarray | None = None  # always the RAW feature channels
         self.feature_group_sizes: list[tuple[str, int]] | None = None
+        # which filter-bank transform the heatmap shows: None = raw, else (kind, sigma).
+        # Lets the user *see* what each filter does to every channel. Cached separately
+        # from self.features so switching files or filters just drops the cache.
+        self._filter_view: tuple[str, float] | None = None
+        self._display_cache: np.ndarray | None = None
         self.class_colors: dict[str, str] = {}
         # (lo, hi) inclusive frame range picked via Shift+drag on the timeline, for
         # one-shot bout labeling; None when nothing is selected
@@ -81,6 +87,17 @@ class TimelineWidget(QWidget):
         self.reset_zoom_button = QPushButton("Reset zoom")
         self.reset_zoom_button.clicked.connect(self._on_reset_zoom_clicked)
         controls_row.addWidget(self.reset_zoom_button)
+
+        controls_row.addSpacing(12)
+        controls_row.addWidget(QLabel("Feature view:"))
+        self.filter_combo = QComboBox()
+        self.filter_combo.setToolTip("Show the raw features, or their response to one filter-bank filter")
+        self.filter_combo.addItem("Raw", userData=None)
+        for kind in filterbank.FILTER_KINDS:
+            for sigma in filterbank.DEFAULT_SIGMAS:
+                self.filter_combo.addItem(f"{kind.capitalize()} σ={sigma:g}", userData=(kind, sigma))
+        self.filter_combo.currentIndexChanged.connect(self._on_filter_view_changed)
+        controls_row.addWidget(self.filter_combo)
 
         controls_row.addStretch()
         controls_row.addWidget(QLabel("Ctrl+scroll: zoom  |  Ctrl+drag: pan  |  Shift+drag: select range"))
@@ -120,21 +137,42 @@ class TimelineWidget(QWidget):
         self.predictions = predictions
         self.annotations = annotations
         self.features = features
+        self._display_cache = None  # raw channels changed; recompute the filtered view lazily
         self.feature_group_sizes = feature_group_sizes
         self.class_colors = class_colors
         self.canvas.sync_group_controls()
         self.canvas.invalidate()
 
+    def display_features(self) -> np.ndarray | None:
+        """The feature channels as currently shown: raw, or run through the selected
+        filter-bank filter (shape-preserving, so grouping/labels stay put)."""
+        if self.features is None or self._filter_view is None:
+            return self.features
+        if self._display_cache is None:
+            kind, sigma = self._filter_view
+            self._display_cache = filterbank.apply_single_filter(self.features, kind, sigma)
+        return self._display_cache
+
     def group_feature_slice(self, group_name: str) -> np.ndarray | None:
-        """This group's rows within `self.features`, or None if not currently known."""
-        if self.features is None or not self.feature_group_sizes:
+        """This group's rows within the currently displayed features, or None if unknown."""
+        features = self.display_features()
+        if features is None or not self.feature_group_sizes:
             return None
         offset = 0
         for name, count in self.feature_group_sizes:
             if name == group_name:
-                return self.features[offset : offset + count]
+                return features[offset : offset + count]
             offset += count
         return None
+
+    def _on_filter_view_changed(self, index: int) -> None:
+        self._filter_view = self.filter_combo.itemData(index)
+        self._display_cache = None
+        # each filter lives on its own value scale (a rate ~0, a std >=0), so a contrast
+        # tuned for one view is meaningless for the next - drop it and let it auto-scale
+        self.group_vmin = {}
+        self.group_vmax = {}
+        self.canvas.invalidate()
 
     def set_selection(self, start_frame: int, end_frame: int) -> None:
         if self.n_frames == 0:
@@ -319,7 +357,8 @@ class _TimelineCanvas(QWidget):
 
         n_frames = self.owner.n_frames
         view_start, view_end = self.owner.view_start, self.owner.view_end
-        features = self.owner.features
+        features = self.owner.features  # raw: drives the undetected (NaN) mask
+        display_features = self.owner.display_features()  # what the heatmap actually shows
         class_colors = self.owner.class_colors
 
         if n_frames > 0 and view_end > view_start:
@@ -351,7 +390,7 @@ class _TimelineCanvas(QWidget):
                 for (_label, y0, y1), (group_name, count) in zip(spans, group_sizes):
                     group_h = y1 - y0
                     if group_h > 0 and count > 0:
-                        group_features = features[row_start : row_start + count]
+                        group_features = display_features[row_start : row_start + count]
                         colormap_name = self.owner.group_colormap.get(group_name, timeline.DEFAULT_COLORMAP)
                         vmin = self.owner.group_vmin.get(group_name)
                         vmax = self.owner.group_vmax.get(group_name)

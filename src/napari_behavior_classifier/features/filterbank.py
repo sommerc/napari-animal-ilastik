@@ -15,6 +15,28 @@ from scipy.ndimage import gaussian_filter1d
 
 DEFAULT_SIGMAS = (1.0, 3.0, 9.0, 27.0)
 
+# the three per-scale transforms produced for every channel (see apply_filter_bank);
+# named here so callers (e.g. the timeline "feature view" selector) can enumerate them
+FILTER_KINDS = ("smooth", "rate", "variability")
+
+
+def apply_single_filter(features: np.ndarray, kind: str, sigma: float) -> np.ndarray:
+    """One filter-bank transform applied per channel along time, shape-preserving:
+    (n_features, n_frames) -> (n_features, n_frames). Used to *view* the effect of a
+    single filter (kind in FILTER_KINDS) at one scale, not to build a training matrix."""
+    if kind not in FILTER_KINDS:
+        raise ValueError(f"unknown filter kind {kind!r}; expected one of {FILTER_KINDS}")
+    out = np.empty_like(features, dtype=np.float32)
+    for i in range(features.shape[0]):
+        filled = _fill_nans(features[i])
+        if kind == "smooth":
+            out[i] = gaussian_filter1d(filled, sigma=sigma)
+        elif kind == "rate":
+            out[i] = gaussian_filter1d(filled, sigma=sigma, order=1)
+        else:  # "variability"
+            out[i] = _local_std(filled, sigma)
+    return out
+
 
 def with_filter_bank(
     features: np.ndarray,
