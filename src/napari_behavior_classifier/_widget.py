@@ -146,8 +146,7 @@ class _TrainingSummaryDialog(QDialog):
             else "Out-of-bag accuracy: n/a (not enough labeled frames per class)"
         )
         header_lines = [
-            f"Individuals (pooled): {', '.join(individuals)}",
-            f"Files: {', '.join(file_names)}",
+            f"Individuals pooled: {len(individuals)}  |  Files: {len(file_names)}",
             f"Labeled frames: {n_frames}  |  Features: {n_features}",
             accuracy_line,
         ]
@@ -155,18 +154,22 @@ class _TrainingSummaryDialog(QDialog):
         layout.addWidget(header_label)
 
         classes = report.classes if report is not None else sorted(class_counts)
-        headers = ["Class", "Annotated", "Precision", "Recall", "F1"] + [f"-> {c}" for c in classes]
+        # a blank spacer column visually detaches the confusion matrix from the metrics
+        metric_headers = ["Class", "Annotated", "Precision", "Recall", "F1"]
+        sep_col = len(metric_headers)
+        headers = metric_headers + [""] + [f"-> {c}" for c in classes]
         table = QTableWidget(len(classes), len(headers))
         table.setHorizontalHeaderLabels(headers)
         table.verticalHeader().setVisible(False)
 
         for row, cls in enumerate(classes):
-            values = [cls, str(class_counts.get(cls, 0))]
             if report is not None:
-                values += [f"{report.precision[row]:.2f}", f"{report.recall[row]:.2f}", f"{report.f1[row]:.2f}"]
-                values += [str(n) for n in report.confusion[row]]
+                metrics = [f"{report.precision[row]:.2f}", f"{report.recall[row]:.2f}", f"{report.f1[row]:.2f}"]
+                confusion = [str(n) for n in report.confusion[row]]
             else:
-                values += ["n/a"] * (len(headers) - 2)
+                metrics = ["n/a", "n/a", "n/a"]
+                confusion = ["n/a"] * len(classes)
+            values = [cls, str(class_counts.get(cls, 0))] + metrics + [""] + confusion
             for col, value in enumerate(values):
                 item = QTableWidgetItem(value)
                 item.setFlags(item.flags() & ~Qt.ItemFlag.ItemIsEditable)
@@ -174,7 +177,9 @@ class _TrainingSummaryDialog(QDialog):
                 table.setItem(row, col, item)
 
         table.resizeColumnsToContents()
-        table.setMinimumHeight(120)
+        table.resizeRowsToContents()
+        table.setColumnWidth(sep_col, 16)  # narrow gap, independent of its (empty) contents
+        self._fit_table(table)
         layout.addWidget(table)
 
         button_row = QHBoxLayout()
@@ -185,6 +190,20 @@ class _TrainingSummaryDialog(QDialog):
         button_row.addWidget(copy_button)
         button_row.addWidget(close_button)
         layout.addLayout(button_row)
+
+    @staticmethod
+    def _fit_table(table: QTableWidget) -> None:
+        """Grow the table's minimum size to its full contents so the dialog opens with
+        every row and column visible - no scrolling, no manual resize needed."""
+        frame = table.frameWidth() * 2
+        width = frame + sum(table.columnWidth(c) for c in range(table.columnCount()))
+        if not table.verticalHeader().isHidden():
+            width += table.verticalHeader().width()
+        # reserve the vertical-scrollbar extent so its (rare) appearance can't clip a column
+        width += table.verticalScrollBar().sizeHint().width()
+        height = frame + table.horizontalHeader().height()
+        height += sum(table.rowHeight(r) for r in range(table.rowCount()))
+        table.setMinimumSize(width + 2, height + 2)  # +2 so rounding never trips a scrollbar
 
     @staticmethod
     def _as_text(header_lines: list[str], headers: list[str], table: QTableWidget) -> str:
