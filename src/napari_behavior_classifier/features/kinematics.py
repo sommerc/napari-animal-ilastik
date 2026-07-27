@@ -28,11 +28,22 @@ same reason: each row depends only on that one node, not a neighbor.
 
 from __future__ import annotations
 
+import warnings
 from dataclasses import dataclass
 from typing import Callable
 
 import numpy as np
 import xarray as xr
+
+
+def _centroid(pos: np.ndarray) -> np.ndarray:
+    """All-keypoints nanmean per frame, (time, 2). Frames where every body part is
+    undetected are all-NaN slices - np.nanmean warns "Mean of empty slice" on those
+    (napari surfaces that as a user notification), so silence just that warning; the
+    NaN centroid it returns is expected and handled downstream by the pipeline's imputer."""
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", "Mean of empty slice", RuntimeWarning)
+        return np.nanmean(pos, axis=1)
 
 
 def _node_adjacency(edges: list[tuple[int, int]], n_nodes: int) -> dict[int, list[int]]:
@@ -243,7 +254,7 @@ def compute_angular_velocities(ds: xr.Dataset, individual: str) -> tuple[np.ndar
     pos = ds["position"].sel(individuals=individual).values  # (time, keypoints, 2)
     node_names = list(ds.coords["keypoints"].values)
 
-    centroid = np.nanmean(pos, axis=1)  # (time, 2)
+    centroid = _centroid(pos)  # (time, 2)
     relative = pos - centroid[:, None, :]  # (time, keypoints, 2): centroid -> node
 
     angle = np.degrees(np.arctan2(relative[..., 1], relative[..., 0]))  # (time, keypoints)
@@ -262,7 +273,7 @@ def compute_speeds(ds: xr.Dataset, individual: str) -> tuple[np.ndarray, list[st
     rows: list[np.ndarray] = []
     names: list[str] = []
 
-    centroid = np.nanmean(pos, axis=1)  # (time, 2)
+    centroid = _centroid(pos)  # (time, 2)
     rows.append(_speed(centroid))
     names.append("speed_centroid")
 

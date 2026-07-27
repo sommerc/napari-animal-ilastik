@@ -58,6 +58,16 @@ class LabelStore:
         if changed:
             self._notify()
 
+    def rename_class(self, old_name: str, new_name: str) -> None:
+        """Relabel every frame currently tagged `old_name` as `new_name` (keys unchanged)."""
+        changed = False
+        for key, cls in self.labels.items():
+            if cls == old_name:
+                self.labels[key] = new_name
+                changed = True
+        if changed:
+            self._notify()
+
     def get(self, source_file: str, individual: str, frame: int) -> str | None:
         return self.labels.get((self._normalize(source_file), individual, frame))
 

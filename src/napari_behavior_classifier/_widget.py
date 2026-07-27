@@ -9,9 +9,11 @@ import numpy as np
 import pandas as pd
 from napari.utils.notifications import show_info
 from qtpy.QtCore import Qt
-from qtpy.QtGui import QColor, QFont, QKeySequence, QShortcut
+from qtpy.QtGui import QColor, QFont, QKeySequence, QPainter, QPen, QShortcut
 from qtpy.QtWidgets import (
+    QAbstractItemView,
     QApplication,
+    QColorDialog,
     QComboBox,
     QDialog,
     QFileDialog,
@@ -20,8 +22,12 @@ from qtpy.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QMenu,
     QMessageBox,
     QPushButton,
+    QStyle,
+    QStyledItemDelegate,
+    QStyleOptionViewItem,
     QTableWidget,
     QTableWidgetItem,
     QVBoxLayout,
@@ -53,6 +59,39 @@ _CLASS_COLORS = [
     "#e6194b", "#3cb44b", "#4363d8", "#46f0f0", "#f032e6",
     "#FF9100", "#911eb4", "#f58231", "#f5c8d9", "#9a6324",
 ]
+
+
+class _ClassListDelegate(QStyledItemDelegate):
+    """Renders class rows so a *selected* row keeps its own class-color background
+    (the stock view paints the theme highlight right over it) - selection is shown
+    with a black/white double border instead. Also feeds the inline rename editor
+    the plain class name (UserRole) rather than the "N. name" display text."""
+
+    def paint(self, painter: QPainter, option: QStyleOptionViewItem, index) -> None:
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        selected = bool(opt.state & QStyle.StateFlag.State_Selected)
+        # drop the selected flag so super() paints the item's own background + text,
+        # not the highlight brush
+        opt.state &= ~QStyle.StateFlag.State_Selected
+        super().paint(painter, opt, index)
+        if selected:
+            painter.save()
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)
+            outer = option.rect.adjusted(1, 1, -2, -2)
+            painter.setPen(QPen(QColor("#000000"), 1))
+            painter.drawRect(outer)
+            # inner white line keeps the border visible on both dark and light swatches
+            painter.setPen(QPen(QColor("#ffffff"), 1))
+            painter.drawRect(outer.adjusted(1, 1, -1, -1))
+            painter.restore()
+
+    def setEditorData(self, editor, index) -> None:
+        name = index.data(Qt.ItemDataRole.UserRole)
+        if name is not None and hasattr(editor, "setText"):
+            editor.setText(str(name))
+        else:
+            super().setEditorData(editor, index)
 
 
 @dataclass
@@ -222,6 +261,11 @@ class BehaviorClassifierWidget(QWidget):
             "Classes (1-9: label current frame, or Shift+drag a range on the timeline first; 0: clear):"
         ))
         self.class_list = QListWidget()
+        self.class_list.setItemDelegate(_ClassListDelegate(self.class_list))
+        self.class_list.setEditTriggers(QAbstractItemView.EditTrigger.DoubleClicked)
+        self.class_list.itemChanged.connect(self._on_class_item_changed)
+        self.class_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.class_list.customContextMenuRequested.connect(self._on_class_context_menu)
         layout.addWidget(self.class_list)
 
         add_row = QHBoxLayout()
@@ -403,6 +447,7 @@ class BehaviorClassifierWidget(QWidget):
         font.setBold(True)
         item.setFont(font)
         item.setData(Qt.ItemDataRole.UserRole, name)
+        item.setFlags(item.flags() | Qt.ItemFlag.ItemIsEditable)  # double-click to rename
         return item
 
     def _on_add_class(self) -> None:
@@ -425,10 +470,73 @@ class BehaviorClassifierWidget(QWidget):
             self._refresh_timeline()
 
     def _renumber_classes(self) -> None:
+        # programmatic setText would otherwise re-fire itemChanged and be misread as a rename
+        self.class_list.blockSignals(True)
         for i in range(self.class_list.count()):
             item = self.class_list.item(i)
             name = item.data(Qt.ItemDataRole.UserRole)
             item.setText(f"{i + 1}. {name}")
+        self.class_list.blockSignals(False)
+
+    def _set_item_name(self, item: QListWidgetItem, name: str) -> None:
+        """Set an item's stored name + numbered display text without re-firing itemChanged."""
+        self.class_list.blockSignals(True)
+        item.setData(Qt.ItemDataRole.UserRole, name)
+        item.setText(f"{self.class_list.row(item) + 1}. {name}")
+        self.class_list.blockSignals(False)
+
+    def _on_class_item_changed(self, item: QListWidgetItem) -> None:
+        """An inline rename editor committed: the delegate wrote the typed plain name
+        into the item's display text. Validate it, then rename everywhere or revert."""
+        old_name = item.data(Qt.ItemDataRole.UserRole)
+        new_name = item.text().strip()
+        others = [n for n in self._class_names() if n != old_name]
+        if not new_name or new_name == old_name or new_name in others:
+            self._set_item_name(item, old_name)  # invalid/duplicate: restore display
+            return
+        self._rename_class(old_name, new_name, item)
+
+    def _rename_class(self, old_name: str, new_name: str, item: QListWidgetItem) -> None:
+        # preserve dict order so the auto color-cycling in _on_add_class stays stable
+        self._class_colors = {
+            (new_name if k == old_name else k): v for k, v in self._class_colors.items()
+        }
+        self.store.rename_class(old_name, new_name)
+        for preds in self._predictions.values():
+            preds[preds == old_name] = new_name
+        self._set_item_name(item, new_name)
+        self._rebind_hotkeys()
+        self._refresh_timeline()
+        if self.active_layers is not None:
+            self.active_layers.refresh()
+
+    def _on_class_context_menu(self, pos) -> None:
+        item = self.class_list.itemAt(pos)
+        if item is None:
+            return
+        menu = QMenu(self.class_list)
+        rename_action = menu.addAction("Rename")
+        color_action = menu.addAction("Change color...")
+        action = menu.exec_(self.class_list.viewport().mapToGlobal(pos))
+        if action == rename_action:
+            self.class_list.editItem(item)
+        elif action == color_action:
+            self._change_class_color(item)
+
+    def _change_class_color(self, item: QListWidgetItem) -> None:
+        name = item.data(Qt.ItemDataRole.UserRole)
+        current = QColor(self._class_colors.get(name, "#ffffff"))
+        color = QColorDialog.getColor(current, self, f"Color for '{name}'")
+        if not color.isValid():
+            return
+        hex_color = color.name()  # 6-digit "#rrggbb" - vispy/napari-safe (no ARGB ambiguity)
+        self._class_colors[name] = hex_color
+        self.class_list.blockSignals(True)
+        item.setBackground(QColor(hex_color))
+        self.class_list.blockSignals(False)
+        self._refresh_timeline()
+        if self.active_layers is not None:
+            self.active_layers.refresh()
 
     def _class_names(self) -> list[str]:
         return [self.class_list.item(i).data(Qt.ItemDataRole.UserRole) for i in range(self.class_list.count())]

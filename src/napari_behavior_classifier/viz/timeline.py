@@ -11,6 +11,8 @@ still divide evenly across the same pixel width.
 
 from __future__ import annotations
 
+import warnings
+
 import numpy as np
 from napari.utils import Colormap
 from napari.utils.colormaps import AVAILABLE_COLORMAPS
@@ -111,7 +113,12 @@ def build_feature_heatmap(
     if n_frames == 0:
         return np.zeros((n_features, width), dtype=np.float32)
 
-    row_mean = np.nanmean(features, axis=1, keepdims=True)
+    # an all-NaN feature row (e.g. a fully-undetected individual) is an "empty slice"
+    # to nanmean - napari would pop that RuntimeWarning as a notification; the NaN it
+    # returns is immediately zeroed on the next line, so the warning is pure noise
+    with warnings.catch_warnings():
+        warnings.filterwarnings("ignore", "Mean of empty slice", RuntimeWarning)
+        row_mean = np.nanmean(features, axis=1, keepdims=True)
     row_mean = np.nan_to_num(row_mean, nan=0.0)
     filled = np.where(np.isnan(features), row_mean, features)
 
