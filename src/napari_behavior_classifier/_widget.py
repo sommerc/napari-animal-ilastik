@@ -61,6 +61,24 @@ _CLASS_COLORS = [
 ]
 
 
+def _contrasting_text_color(color: str) -> QColor:
+    """Black on light swatches, white on dark ones - so the class name stays legible
+    whatever color the user picks (the default light-theme text is white, which
+    vanishes on bright yellow/pink). Picks whichever of black/white has the higher
+    WCAG contrast ratio against the swatch (this beats a plain average-luminance
+    threshold on saturated mid-tones like bright greens, where black wins clearly)."""
+    c = QColor(color)
+
+    def _linear(channel: int) -> float:
+        v = channel / 255
+        return v / 12.92 if v <= 0.03928 else ((v + 0.055) / 1.055) ** 2.4
+
+    luminance = 0.2126 * _linear(c.red()) + 0.7152 * _linear(c.green()) + 0.0722 * _linear(c.blue())
+    contrast_black = (luminance + 0.05) / 0.05
+    contrast_white = 1.05 / (luminance + 0.05)
+    return QColor("#000000") if contrast_black >= contrast_white else QColor("#ffffff")
+
+
 class _ClassListDelegate(QStyledItemDelegate):
     """Renders class rows so a *selected* row keeps its own class-color background
     (the stock view paints the theme highlight right over it) - selection is shown
@@ -443,6 +461,7 @@ class BehaviorClassifierWidget(QWidget):
     def _new_class_list_item(self, name: str, color: str) -> QListWidgetItem:
         item = QListWidgetItem(f"{self.class_list.count() + 1}. {name}")
         item.setBackground(QColor(color))
+        item.setForeground(_contrasting_text_color(color))
         font = item.font()
         font.setBold(True)
         item.setFont(font)
@@ -533,6 +552,7 @@ class BehaviorClassifierWidget(QWidget):
         self._class_colors[name] = hex_color
         self.class_list.blockSignals(True)
         item.setBackground(QColor(hex_color))
+        item.setForeground(_contrasting_text_color(hex_color))
         self.class_list.blockSignals(False)
         self._refresh_timeline()
         if self.active_layers is not None:
