@@ -8,8 +8,19 @@ from __future__ import annotations
 
 import napari
 import numpy as np
-from qtpy.QtCore import QRectF, Qt, Signal
-from qtpy.QtGui import QColor, QImage, QMouseEvent, QPainter, QPen, QPixmap, QResizeEvent, QWheelEvent
+from qtpy.QtCore import QRectF, Qt, QTimer, Signal
+from qtpy.QtGui import (
+    QColor,
+    QImage,
+    QKeySequence,
+    QMouseEvent,
+    QPainter,
+    QPen,
+    QPixmap,
+    QResizeEvent,
+    QShortcut,
+    QWheelEvent,
+)
 from qtpy.QtWidgets import QComboBox, QHBoxLayout, QLabel, QPushButton, QSizePolicy, QVBoxLayout, QWidget
 
 from ..features import filterbank
@@ -38,6 +49,9 @@ CURRENT_FRAME_OUTLINE_WIDTH = 4
 CURRENT_FRAME_LINE_WIDTH = 2
 # translucent so the annotation/prediction bars and heatmap stay legible underneath
 SELECTION_FILL_COLOR = (255, 255, 0, 60)
+# looped playback of a Shift+drag selection (Space toggles); ~20 fps reads a bout
+# smoothly without the frame marker visibly skipping
+PLAYBACK_INTERVAL_MS = 50
 
 # Distances/speed are plain sequential magnitudes; angles vary around a meaningful
 # baseline ("straight") rather than from a true zero, so a diverging colormap reads
@@ -112,6 +126,17 @@ class TimelineWidget(QWidget):
         self.setMinimumHeight(320)
         self.viewer.dims.events.current_step.connect(lambda event: self.canvas.update())
 
+        # Space-bar loop playback of the current Shift+drag selection. A QTimer drives
+        # the frame stepping; the shortcut is only *enabled* while a selection exists, so
+        # Space falls back to napari's normal handling the rest of the time.
+        self._play_timer = QTimer(self)
+        self._play_timer.timeout.connect(self._advance_playback)
+        self._play_shortcut = QShortcut(QKeySequence(Qt.Key.Key_Space), self.viewer.window._qt_window)
+        self._play_shortcut.setContext(Qt.ShortcutContext.ApplicationShortcut)
+        self._play_shortcut.setAutoRepeat(False)  # holding Space must not retrigger the toggle
+        self._play_shortcut.setEnabled(False)
+        self._play_shortcut.activated.connect(self.toggle_loop_playback)
+
     def set_data(
         self,
         n_frames: int,
@@ -130,6 +155,8 @@ class TimelineWidget(QWidget):
             self.group_vmin = {}
             self.group_vmax = {}
             self.selection = None
+            self._stop_playback()  # the old selection's frame range no longer applies
+            self._play_shortcut.setEnabled(False)
         for name, _count in feature_group_sizes or []:
             self.group_colormap.setdefault(name, _DEFAULT_GROUP_COLORMAP.get(name, timeline.DEFAULT_COLORMAP))
 
@@ -181,12 +208,15 @@ class TimelineWidget(QWidget):
         lo = max(0, min(lo, self.n_frames - 1))
         hi = max(0, min(hi, self.n_frames - 1))
         self.selection = (lo, hi)
+        self._play_shortcut.setEnabled(True)  # Space now toggles loop playback of this range
         self.selection_changed.emit()
         self.canvas.update()
 
     def clear_selection(self) -> None:
         if self.selection is not None:
             self.selection = None
+            self._stop_playback()
+            self._play_shortcut.setEnabled(False)  # hand Space back to napari
             self.selection_changed.emit()
             self.canvas.update()
 
@@ -194,6 +224,31 @@ class TimelineWidget(QWidget):
         self.view_start = 0
         self.view_end = self.n_frames
         self.canvas.invalidate()
+
+    # -- looped playback of the selected range --
+
+    def toggle_loop_playback(self) -> None:
+        """Space-bar handler: start looping the selected range, or stop if already looping."""
+        if self._play_timer.isActive():
+            self._stop_playback()
+        elif self.selection is not None:
+            lo, _hi = self.selection
+            self.viewer.dims.set_current_step(0, lo)  # start each run at the window's first frame
+            self._play_timer.start(PLAYBACK_INTERVAL_MS)
+
+    def _stop_playback(self) -> None:
+        self._play_timer.stop()
+
+    def _advance_playback(self) -> None:
+        """One frame forward, wrapping back to the start once past the selected end."""
+        if self.selection is None:
+            self._stop_playback()
+            return
+        lo, hi = self.selection
+        frame = int(self.viewer.dims.current_step[0]) + 1
+        if frame > hi or frame < lo:
+            frame = lo
+        self.viewer.dims.set_current_step(0, frame)
 
     def _on_group_colormap_changed(self, group_name: str, colormap_name: str) -> None:
         self.group_colormap[group_name] = colormap_name
