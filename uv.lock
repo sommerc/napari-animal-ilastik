@@ -1336,7 +1336,7 @@ pyqt = [
 ]
 
 [[package]]
-name = "napari-behavior-classifier"
+name = "napari-animal-ilastik"
 version = "0.1.0"
 source = { editable = "." }
 dependencies = [

@@ -1,10 +1,10 @@
-name: napari-behavior-classifier
+name: napari-animal-ilastik
 display_name: Behavior Classifier
 contributions:
   commands:
-    - id: napari-behavior-classifier.make_behavior_classifier_widget
+    - id: napari-animal-ilastik.make_behavior_classifier_widget
       python_name: napari_behavior_classifier._widget:BehaviorClassifierWidget
       title: Open Behavior Classifier
   widgets:
-    - command: napari-behavior-classifier.make_behavior_classifier_widget
+    - command: napari-animal-ilastik.make_behavior_classifier_widget
       display_name: Behavior Classifier

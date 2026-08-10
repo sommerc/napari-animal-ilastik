@@ -1,5 +1,5 @@
 [project]
-name = "napari-behavior-classifier"
+name = "napari-animal-ilastik"
 version = "0.1.0"
 description = "Add your description here"
 readme = "README.md"
@@ -20,12 +20,12 @@ dependencies = [
 ]
 
 [project.entry-points."napari.manifest"]
-napari-behavior-classifier = "napari_behavior_classifier:napari.yaml"
+napari-animal-ilastik = "napari_behavior_classifier:napari.yaml"
 
 [project.scripts]
 napari = "napari._main:main"
-napari-behavior-train = "napari_behavior_classifier.cli.train:main"
-napari-behavior-predict = "napari_behavior_classifier.cli.predict:main"
+anilastik-train = "napari_behavior_classifier.cli.train:main"
+anilastik-predict = "napari_behavior_classifier.cli.predict:main"
 
 [build-system]
 requires = ["hatchling"]
