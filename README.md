@@ -50,11 +50,17 @@ feature-and-scale combinations to use is fully configurable in the **Select feat
 
 ## Installation
 
-Requires [uv](https://docs.astral.sh/uv/) and SSH access to the ISTA GitLab.
+Requires [uv](https://docs.astral.sh/uv/).
 
 Install as an isolated tool (recommended - keeps napari and the plugin in their own
-environment, exposes the `napari`, `anilastik-train`, and `anilastik-predict`
+environment, exposes the `anilastik`, `anilastik-train`, and `anilastik-predict`
 commands on your PATH):
+
+```sh
+uv tool install "napari-animal-ilastik @ git+https://github.com/sommerc/napari-animal-ilastik.git"
+```
+
+Alternatively, from the ISTA GitLab (requires SSH access):
 
 ```sh
 uv tool install "napari-animal-ilastik @ git+ssh://git@git.ista.ac.at/csommer/napari_behavior_classifier.git"
@@ -63,11 +69,13 @@ uv tool install "napari-animal-ilastik @ git+ssh://git@git.ista.ac.at/csommer/na
 
 ## Usage
 
-Launch napari and open the plugin from the menu: **Plugins -> Behavior Classifier**
+Launch napari with the Behavior Classifier already loaded:
 
 ```sh
-napari
+anilastik
 ```
+
+(The widget is also available under **Plugins -> Behavior Classifier** in any napari session.)
 
 For batch/headless use:
 
